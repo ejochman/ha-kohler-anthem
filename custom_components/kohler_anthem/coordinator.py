@@ -98,10 +98,12 @@ from .const import (
     CONF_VALVES,
     CONF_WARMUP_AUTO_RESTORE,
     CONF_WATER_UNITS,
+    CONF_ZONE_GROUPING,
     CONF_ZONE_OUTLETS,
     DEFAULT_FLOW_PERCENT,
     DEFAULT_PRESET_ID,
     DEFAULT_PRESET_TIMER_SECONDS,
+    DEFAULT_ZONE_GROUPING,
     DEVICE_NAME_CONTROLLER,
     DEVICE_NAME_VALVE,
     DOMAIN,
@@ -122,6 +124,7 @@ from .const import (
     WARMUP_CONTEXT_BEFORE_SECONDS,
     WARMUP_CONTEXT_MAX_MESSAGES,
     WARMUP_DEBUG_LOG_KEEP_FILES,
+    ZONE_GROUPING_MODES,
 )
 from .warmup_manager import WarmupManager
 
@@ -751,6 +754,10 @@ class Valve:
     @property
     def temperature_unit(self) -> str:
         return self.coordinator.temperature_unit
+
+    @property
+    def zone_grouping(self) -> str:
+        return self.coordinator.zone_grouping
 
     @property
     def warmup_log(self) -> DebugJournal | None:
@@ -1991,6 +1998,12 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Rolling record of recent messages, so a warmup disable can be journalled
         # with what surrounded it. Bounded by count and trimmed by age on read.
         self._recent_messages: deque = deque(maxlen=WARMUP_CONTEXT_MAX_MESSAGES)
+
+    @property
+    def zone_grouping(self) -> str:
+        """How multi-zone valve outlets, controls, and sensors are grouped and named."""
+        mode = self.entry.options.get(CONF_ZONE_GROUPING, DEFAULT_ZONE_GROUPING)
+        return mode if mode in ZONE_GROUPING_MODES else DEFAULT_ZONE_GROUPING
 
     # ------------------------------------------------------------------ #
     # Setup / teardown

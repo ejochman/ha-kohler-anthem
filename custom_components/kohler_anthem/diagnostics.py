@@ -670,7 +670,9 @@ async def async_get_device_diagnostics(
         if domain != DOMAIN:
             continue
         for index, valve in enumerate(coordinator.valves):
-            if identifier == valve.device_id:
+            if identifier == valve.device_id or identifier.startswith(
+                f"{valve.device_id}_zone_"
+            ):
                 requested_for = (
                     "valve" if len(coordinator.valves) == 1 else f"valve_{index}"
                 )

@@ -23,10 +23,11 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 
-from .const import CONF_VALVES, DOMAIN
+from .const import CONF_VALVES, DOMAIN, ZONE_GROUPING_SUBDEVICES
 from .coordinator import KohlerAnthemCoordinator, entry_reload_signature
 from .services import async_register_services, async_unregister_services
 
@@ -178,6 +179,65 @@ def _async_strip_removed_valve_keys(hass: HomeAssistant, entry: ConfigEntry) -> 
     _LOGGER.info("Removed the retired Endless Shower settings from the config entry")
 
 
+@callback
+def _async_ensure_parent_valve_devices(
+    hass: HomeAssistant, entry: ConfigEntry, coordinator: KohlerAnthemCoordinator
+) -> None:
+    """Register parent valve devices before platforms add `via_device` sub-devices."""
+    if coordinator.zone_grouping != ZONE_GROUPING_SUBDEVICES:
+        return
+    try:
+        dev_reg = dr.async_get(hass)
+        for valve in coordinator.valves:
+            if len(valve.model.zones) > 1:
+                dev_reg.async_get_or_create(
+                    config_entry_id=entry.entry_id,
+                    identifiers={(DOMAIN, valve.device_id)},
+                    manufacturer="Kohler",
+                    name=valve.name,
+                    model=valve.model.sku,
+                    model_id=valve.model.name,
+                    serial_number=valve.gcs_device.serial_number,
+                )
+    except Exception:
+        _LOGGER.debug("Device registry unavailable during parent valve setup")
+
+
+@callback
+def _async_cleanup_zone_subdevices(
+    hass: HomeAssistant, entry: ConfigEntry, coordinator: KohlerAnthemCoordinator
+) -> None:
+    """Remove zone sub-devices when sub-device grouping is not active."""
+    active_subdevice_ids: set[str] = set()
+    if coordinator.zone_grouping == ZONE_GROUPING_SUBDEVICES:
+        for valve in coordinator.valves:
+            if len(valve.model.zones) > 1:
+                for zone in valve.model.zones:
+                    active_subdevice_ids.add(f"{valve.device_id}_zone_{zone}")
+
+    valve_prefixes = tuple(f"{valve.device_id}_zone_" for valve in coordinator.valves)
+    if not valve_prefixes:
+        return
+
+    try:
+        dev_reg = dr.async_get(hass)
+        devices = list(dr.async_entries_for_config_entry(dev_reg, entry.entry_id))
+    except Exception:
+        _LOGGER.debug("Device registry unavailable during zone sub-device cleanup")
+        return
+
+    for device in devices:
+        for domain, identifier in device.identifiers:
+            if (
+                domain == DOMAIN
+                and identifier.startswith(valve_prefixes)
+                and identifier not in active_subdevice_ids
+            ):
+                dev_reg.async_remove_device(device.id)
+                _LOGGER.info("Removed unused zone sub-device %s", device.name)
+                break
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Kohler Anthem from a config entry."""
     _async_purge_removed_diagnostics(hass, entry)
@@ -197,8 +257,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    _async_ensure_parent_valve_devices(hass, entry, coordinator)
     if PLATFORMS:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    _async_cleanup_zone_subdevices(hass, entry, coordinator)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     # Services are global, not per entry — `async_register_services` is idempotent so this
     # is safe on every entry and every reload. It registers nothing for a HUB-only account:

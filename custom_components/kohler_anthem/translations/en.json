@@ -35,6 +35,17 @@
       "reauth_successful": "Reconnected successfully."
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Zone & Outlet Grouping",
+        "description": "Choose how outlets, zone controls (Temperature, Flow), and zone sensors (Shower Active, Hex) are grouped on multi-zone valves.",
+        "data": {
+          "zone_grouping": "Zone grouping style"
+        }
+      }
+    }
+  },
   "issues": {
     "outlet_write_unverified": {
       "title": "A shower setting may not have been applied",

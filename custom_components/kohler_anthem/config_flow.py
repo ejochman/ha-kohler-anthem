@@ -21,8 +21,14 @@ import logging
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
     SelectOptionDict,
@@ -54,8 +60,13 @@ from .const import (
     CONF_TENANT_ID,
     CONF_VALVE_MODEL,
     CONF_WATER_UNITS,
+    CONF_ZONE_GROUPING,
     CONF_ZONE_OUTLETS,
+    DEFAULT_ZONE_GROUPING,
     DOMAIN,
+    ZONE_GROUPING_NUMBERED,
+    ZONE_GROUPING_OUTLET_LABELS,
+    ZONE_GROUPING_SUBDEVICES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -84,16 +95,52 @@ def _valve_schema() -> vol.Schema:
     )
 
 
+def _options_schema(current_grouping: str) -> vol.Schema:
+    """Selector for multi-zone outlet and control grouping."""
+    options = [
+        SelectOptionDict(
+            value=ZONE_GROUPING_SUBDEVICES,
+            label=(
+                "Sub-device per zone — separate Zone 1 / Zone 2 devices, "
+                "no zone numbers on outlets or controls"
+            ),
+        ),
+        SelectOptionDict(
+            value=ZONE_GROUPING_OUTLET_LABELS,
+            label=(
+                "Outlet names on controls — single device, e.g. "
+                "Temperature (Showerhead, Body Sprays)"
+            ),
+        ),
+        SelectOptionDict(
+            value=ZONE_GROUPING_NUMBERED,
+            label=(
+                "Zone numbers (default) — single device, appends 1 / 2 "
+                "to outlets and controls"
+            ),
+        ),
+    ]
+    return vol.Schema(
+        {
+            vol.Required(CONF_ZONE_GROUPING, default=current_grouping): SelectSelector(
+                SelectSelectorConfig(options=options, mode=SelectSelectorMode.LIST)
+            )
+        }
+    )
+
+
 class KohlerAnthemConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the Kohler Anthem config flow."""
 
     VERSION = 1
 
-    # No options flow, deliberately — removed 2026-08-22 on the owner's decision. Its one
-    # option duplicated a switch on the device page (Endless Shower, itself removed
-    # 2026-10-08), which is the better control, and the flow carried a latent bug besides: saving it replaced the entry's options wholesale with its single
-    # key, which would have wiped the stored warmup keys the moment anyone used Configure.
-    # The entities that persist to `entry.options` still do; only the dialog is gone.
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: ConfigEntry,
+    ) -> KohlerAnthemOptionsFlow:
+        """Return the options flow for this handler."""
+        return KohlerAnthemOptionsFlow(config_entry)
 
     # Attribute names are deliberately prefixed. Home Assistant's ConfigFlow base class
     # defines read-only properties such as `_reauth_entry_id`, and assigning to one raises
@@ -292,5 +339,37 @@ class KohlerAnthemConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
 
-# `KohlerAnthemOptionsFlow` stood here until 2026-08-22 — see the note in the config
-# flow class above for why it went.
+class KohlerAnthemOptionsFlow(OptionsFlow):
+    """Configure display options for Kohler Anthem."""
+
+    def __init__(self, config_entry: ConfigEntry | None = None) -> None:
+        self._entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage how multi-zone outlets, controls, and sensors are grouped."""
+        entry = self._entry
+        if entry is None:
+            try:
+                entry = self.config_entry
+            except (AttributeError, ValueError):
+                entry = None
+        existing_options = dict(entry.options) if entry is not None else {}
+
+        if user_input is not None:
+            # Merge with `existing_options` rather than replacing wholesale:
+            # `entry.options` also holds per-valve Warmup Auto-Restore and
+            # report-log keys.
+            return self.async_create_entry(
+                title="",
+                data={**existing_options, **user_input},
+            )
+
+        current_grouping = existing_options.get(
+            CONF_ZONE_GROUPING, DEFAULT_ZONE_GROUPING
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=_options_schema(current_grouping),
+        )

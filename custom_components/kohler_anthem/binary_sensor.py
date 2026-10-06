@@ -30,7 +30,12 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .anthem.models import OutletStateSource, resolve_outlet_source
-from .const import DOMAIN, EXPOSE_CONTROLLER_WATER_STATE
+from .const import (
+    DEFAULT_ZONE_GROUPING,
+    DOMAIN,
+    EXPOSE_CONTROLLER_WATER_STATE,
+    ZONE_GROUPING_NUMBERED,
+)
 from .coordinator import Controller, KohlerAnthemCoordinator, Valve
 from .entity import KohlerControllerEntity, KohlerValveEntity, zone_label
 
@@ -463,9 +468,11 @@ class ValveZoneActiveSensor(KohlerValveEntity, BinarySensorEntity):
     def __init__(
         self, coordinator: KohlerAnthemCoordinator, valve: Valve, zone: int
     ) -> None:
-        super().__init__(coordinator, valve)
+        super().__init__(coordinator, valve, zone=zone)
         self._zone = zone
-        self._attr_name = zone_label(valve, zone, "Shower Active")
+        grouping = getattr(valve, "zone_grouping", DEFAULT_ZONE_GROUPING)
+        base = "Shower Active" if grouping == ZONE_GROUPING_NUMBERED else "Zone Active"
+        self._attr_name = zone_label(valve, zone, base)
         self._attr_unique_id = f"{self._device_id}_zone_{zone}_active"
 
     @property
