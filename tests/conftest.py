@@ -80,7 +80,15 @@ class FakeState:
         self.last_update = 1789005586.0
         self.presets: dict = {}
         self.active_preset_id = None
-        self.outlet_limits = {i: FakeLimits(t) for i, t in enumerate(types)}
+        outlet_ids = [
+            model.outlet_id(zone, outlet)
+            for zone in model.zones
+            for outlet in range(1, model.outlets_in_zone(zone) + 1)
+        ]
+        self.outlet_limits = {
+            outlet_id: FakeLimits(t)
+            for outlet_id, t in zip(outlet_ids, types, strict=False)
+        }
         self.temperature_unit = "Fahrenheit"
 
     @property

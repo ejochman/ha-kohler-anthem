@@ -1077,7 +1077,10 @@ class Valve:
                 written.append(outlet_id)
         except KohlerError as err:
             # Say exactly how far it got: the outlets already written hold the new value.
-            done = ", ".join(str(o + 1) for o in written) or "none"
+            done = (
+                ", ".join(str(self.model.outlet_from_id(o) or o + 1) for o in written)
+                or "none"
+            )
             raise HomeAssistantError(
                 f"Writing {self.name} failed after outlet {done}. Outlets are now in a "
                 f"mixed state — re-saving the setting rewrites them all. ({err})"
@@ -1142,7 +1145,7 @@ class Valve:
             "default_temperature_tenths": default_temperature_tenths,
         }
         stale = [
-            outlet_id + 1
+            self.model.outlet_from_id(outlet_id) or outlet_id + 1
             for outlet_id, limit in sorted(fresh.items())
             for field, value in wanted.items()
             if value is not None and getattr(limit, field) != value
@@ -1464,9 +1467,13 @@ class Valve:
         compare its run length against — so callers that report readiness must consult this
         rather than assuming the feature is live.
         """
-        return {
-            outlet_id + 1: seconds for outlet_id, seconds in self._run_times.items()
-        }
+        result: dict[int, int] = {}
+        for outlet in range(1, self.model.total_outlets + 1):
+            zone, bit = self.model.outlet_location(outlet)
+            seconds = self._run_times.get(self.model.outlet_id(zone, bit + 1))
+            if seconds is not None:
+                result[outlet] = seconds
+        return result
 
     @property
     def armed_zones(self) -> list[int]:
@@ -1488,11 +1495,11 @@ class Valve:
     @property
     def outlets_awaiting_run_time(self) -> list[int]:
         """Outlets with no known limit yet, 1-based. Empty means every outlet reported."""
-        known = self._run_times
+        known = self.outlet_run_times
         return [
             outlet
             for outlet in range(1, self.model.total_outlets + 1)
-            if (outlet - 1) not in known
+            if outlet not in known
         ]
 
     @property
@@ -1569,7 +1576,7 @@ class Valve:
         _LOGGER.info(
             "Learned run-time limit for outlet(s) %s: %s — the run-time cutoff feature is "
             "armed for them",
-            ", ".join(str(k + 1) for k in sorted(new)),
+            ", ".join(str(self.model.outlet_from_id(k) or k + 1) for k in sorted(new)),
             ", ".join(f"{v}s" for _, v in sorted(new.items())),
         )
         self.store(
@@ -1667,10 +1674,7 @@ class Valve:
         2026-08-17 — see `docs/gcs/api.md`, "two independent timers".
         """
         limits: dict[int, set[int]] = {zone: set() for zone in self.model.zones}
-        for outlet in range(1, self.model.total_outlets + 1):
-            seconds = self._run_times.get(outlet - 1)
-            if seconds is None:
-                continue
+        for outlet, seconds in self.outlet_run_times.items():
             zone, _ = self.model.outlet_location(outlet)
             limits.setdefault(zone, set()).add(seconds)
         return {zone: tuple(sorted(values)) for zone, values in limits.items()}
