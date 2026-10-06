@@ -5,6 +5,21 @@ Notable changes for each tagged release. Versions correspond to git tags and to 
 **Unreleased** as part of each change; the release workflow rotates that section into a
 version heading and publishes it as the release's Highlights.
 
+## Unreleased
+
+- **K-28211 (4-outlet) valves: zone 2 now reads its own outlets.** The valve numbers its
+  outlets 0, 1, 3, 4 — each valve body reserves three slots — where the integration
+  assumed 0-3. Zone 2's fixture names, flow range and run-time limits were read from the
+  wrong outlet, and Max Shower Duration's attributes failed with `ValueError: K-28211 has
+  outlets 1-4; got 5`. Thanks to @ejochman (#1).
+- **⚠️ K-28211 owners: check automations that use zone 2 outlet switches.** An outlet
+  switch's entity id follows its fixture name, and zone 2's names were taken from the wrong
+  outlet. After updating, each zone 2 switch is named for the fixture it actually controls,
+  so an existing entity id can now point at a different physical outlet — for example,
+  `switch.anthem_valve_rainhead_2` used to control zone 2's *second* outlet and now
+  controls the first, which is the actual rainhead. The old `Outlet 2.1` switch is left
+  unavailable and can be removed.
+
 ## 0.02 — 2026-09-12
 
 - **The integration is renamed: Kohler Anthem Plus is now Kohler Anthem.** "Plus" named

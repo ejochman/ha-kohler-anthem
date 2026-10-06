@@ -1676,7 +1676,21 @@ def test_auto_restore_says_whether_the_fault_can_even_occur(valve_model):
 # --------------------------------------------------------------------------- #
 
 
-def _yearly_sensor(valve_model, series, units="Standard", now_month="2026-09"):
+def _yearly_sensor(
+    valve_model, monkeypatch, series, units="Standard", now_month="2026-09"
+):
+    from datetime import datetime
+
+    from custom_components.kohler_anthem import sensor as module
+
+    # Pin the clock: the sensor excludes whatever month `datetime.now` says it is, so on
+    # the real clock these tests start failing the moment `now_month` is in the past.
+    class _PinnedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.strptime(f"{now_month}-15", "%Y-%m-%d").replace(tzinfo=tz)
+
+    monkeypatch.setattr(module, "datetime", _PinnedDateTime)
     valve = make_valve(valve_model, [31, 11, 1])
     valve.usage = {"gcsUsageDataDetailsList": series}
     coordinator = make_coordinator([valve])
@@ -1689,7 +1703,7 @@ def _yearly_sensor(valve_model, series, units="Standard", now_month="2026-09"):
     return sensor
 
 
-def test_yearly_water_sums_twelve_complete_months(valve_model):
+def test_yearly_water_sums_twelve_complete_months(valve_model, monkeypatch):
     """500 gallons a month for a year, in the litres the API actually returns."""
     litres_per_month = 500 / 0.264172
     series = [
@@ -1699,12 +1713,12 @@ def test_yearly_water_sums_twelve_complete_months(valve_model):
         {"intervalKey": f"2026-{m:02d}", "volume": litres_per_month}
         for m in range(1, 9)
     ]
-    sensor = _yearly_sensor(valve_model, series)
+    sensor = _yearly_sensor(valve_model, monkeypatch, series)
     assert sensor.native_value == pytest.approx(6000, abs=1)
     assert sensor.extra_state_attributes["months_counted"] == 12
 
 
-def test_yearly_water_excludes_the_current_month(valve_model):
+def test_yearly_water_excludes_the_current_month(valve_model, monkeypatch):
     """A rolling window that crept up through the month would not be a `TOTAL`.
 
     The partial month belongs to `Water Used This Month`; including it here would make the
@@ -1715,39 +1729,39 @@ def test_yearly_water_excludes_the_current_month(valve_model):
         {"intervalKey": "2026-08", "volume": litres},
         {"intervalKey": "2026-09", "volume": litres * 99},  # the current, partial month
     ]
-    sensor = _yearly_sensor(valve_model, series)
+    sensor = _yearly_sensor(valve_model, monkeypatch, series)
     assert sensor.native_value == pytest.approx(100, abs=1)
     assert sensor.extra_state_attributes["excludes_current_month"] == "2026-09"
 
 
-def test_yearly_water_takes_only_the_twelve_most_recent(valve_model):
+def test_yearly_water_takes_only_the_twelve_most_recent(valve_model, monkeypatch):
     """A 400-day fetch returns thirteen months; the thirteenth must not inflate the year."""
     litres = 100 / 0.264172
     series = [{"intervalKey": f"2025-{m:02d}", "volume": litres} for m in range(1, 13)]
     series += [{"intervalKey": f"2026-{m:02d}", "volume": litres} for m in range(1, 9)]
-    sensor = _yearly_sensor(valve_model, series)
+    sensor = _yearly_sensor(valve_model, monkeypatch, series)
     assert sensor.extra_state_attributes["months_counted"] == 12
     assert sensor.native_value == pytest.approx(1200, abs=1)
     assert sensor.extra_state_attributes["last_month"] == "2026-08"
 
 
-def test_yearly_water_reports_a_short_series_honestly(valve_model):
+def test_yearly_water_reports_a_short_series_honestly(valve_model, monkeypatch):
     """A young account has fewer than twelve months, and must not read as a dry year."""
     litres = 100 / 0.264172
     series = [{"intervalKey": "2026-07", "volume": litres}]
-    sensor = _yearly_sensor(valve_model, series)
+    sensor = _yearly_sensor(valve_model, monkeypatch, series)
     assert sensor.native_value == pytest.approx(100, abs=1)
     assert sensor.extra_state_attributes["months_counted"] == 1
 
 
-def test_yearly_water_stays_in_litres_on_a_metric_account(valve_model):
+def test_yearly_water_stays_in_litres_on_a_metric_account(valve_model, monkeypatch):
     series = [{"intervalKey": "2026-08", "volume": 1000.0}]
-    sensor = _yearly_sensor(valve_model, series, units="Liters")
+    sensor = _yearly_sensor(valve_model, monkeypatch, series, units="Liters")
     assert sensor.native_value == pytest.approx(1000.0)
 
 
-def test_yearly_water_is_none_without_a_series(valve_model):
-    assert _yearly_sensor(valve_model, []).native_value is None
+def test_yearly_water_is_none_without_a_series(valve_model, monkeypatch):
+    assert _yearly_sensor(valve_model, monkeypatch, []).native_value is None
 
 
 # --------------------------------------------------------------------------- #
@@ -2964,6 +2978,7 @@ def _write_valve(monkeypatch, *, fail_after=None, verify_as=None, verify_delay=N
     """A Valve wired for `async_write_outlet_setting`, with the network faked."""
     from custom_components.kohler_anthem import coordinator as module
     from custom_components.kohler_anthem.anthem.client import KohlerError
+    from custom_components.kohler_anthem.anthem.models import get_valve_model
     from custom_components.kohler_anthem.anthem.state import OutletLimits
 
     written: list[int] = []
@@ -2979,10 +2994,13 @@ def _write_valve(monkeypatch, *, fail_after=None, verify_as=None, verify_delay=N
     valve.gcs = _Gcs()
     valve.gcs_device = SimpleNamespace(device_id="gcs-x")
     valve.gcs_state = SimpleNamespace(
+        # Three outlets on one valve, `outLetId`s 0-2. The model is what turns those ids
+        # back into outlet numbers for the partial-write and verification messages.
+        model=get_valve_model("K-28210"),
         outlet_limits={
             i: OutletLimits(i, 16, 200, 1800, 200, 31, 477, 150, 388, 1)
             for i in range(3)
-        }
+        },
     )
     valve._note_local_write = lambda: None
     valve._learn_run_times = lambda state: None
@@ -3413,6 +3431,9 @@ def test_k28211_hardware_outlet_ids_skip_unused_valve1_slot():
         for outlet in range(1, model.outlets_in_zone(zone) + 1)
     ] == [0, 1, 3, 4]
     assert [model.outlet_from_id(i) for i in range(6)] == [1, 2, None, 3, 4, None]
+    # Messages must not report the unused slot as outlet 3, which is a real outlet.
+    assert Valve._outlet_label(SimpleNamespace(model=model), 2) == "id 2"
+    assert Valve._outlet_label(SimpleNamespace(model=model), 3) == "3"
 
     settings = {
         "valveSettings": [
@@ -3485,11 +3506,11 @@ def test_k28211_hardware_outlet_ids_skip_unused_valve1_slot():
         outlet_name(valve, zone, outlet)
         for zone in model.zones
         for outlet in range(1, model.outlets_in_zone(zone) + 1)
-    ] == ["Showerhead", "Outlet 1.2", "Rainhead 2", "Handshower 2"]
+    ] == ["Showerhead 1", "Outlet 1.2", "Rainhead 2", "Handshower 2"]
 
     select = OutletRunTimeSelect(make_coordinator([valve]), valve)
     assert select.extra_state_attributes["per_outlet"] == {
-        "Showerhead": 30.0,
+        "Showerhead 1": 30.0,
         "Outlet 1.2": 30.0,
         "Rainhead 2": 30.0,
         "Handshower 2": 30.0,

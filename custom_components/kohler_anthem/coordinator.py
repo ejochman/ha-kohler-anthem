@@ -815,6 +815,15 @@ class Valve:
         """
         return self.gcs_state.model
 
+    def _outlet_label(self, outlet_id: int) -> str:
+        """A hardware `outLetId` as the outlet number a message should show.
+
+        An id this model has no outlet for is shown as itself rather than as `id + 1`: on a
+        K-28211 the unused slot 2 would otherwise read as outlet 3, a real outlet.
+        """
+        outlet = self.model.outlet_from_id(outlet_id)
+        return f"id {outlet_id}" if outlet is None else str(outlet)
+
     @property
     def issue_id(self) -> str:
         """The Repairs issue id for an Endless Shower on this valve that cannot act.
@@ -1077,10 +1086,7 @@ class Valve:
                 written.append(outlet_id)
         except KohlerError as err:
             # Say exactly how far it got: the outlets already written hold the new value.
-            done = (
-                ", ".join(str(self.model.outlet_from_id(o) or o + 1) for o in written)
-                or "none"
-            )
+            done = ", ".join(self._outlet_label(o) for o in written) or "none"
             raise HomeAssistantError(
                 f"Writing {self.name} failed after outlet {done}. Outlets are now in a "
                 f"mixed state — re-saving the setting rewrites them all. ({err})"
@@ -1145,7 +1151,7 @@ class Valve:
             "default_temperature_tenths": default_temperature_tenths,
         }
         stale = [
-            self.model.outlet_from_id(outlet_id) or outlet_id + 1
+            self._outlet_label(outlet_id)
             for outlet_id, limit in sorted(fresh.items())
             for field, value in wanted.items()
             if value is not None and getattr(limit, field) != value
@@ -1154,7 +1160,7 @@ class Valve:
             self._raise_write_issue(
                 setting,
                 f"{self.name} is still reporting the old value on outlet(s) "
-                f"{', '.join(str(o) for o in stale)}.",
+                f"{', '.join(stale)}.",
             )
             return
         # Verified: clear any warning left by an earlier attempt.
@@ -1576,7 +1582,7 @@ class Valve:
         _LOGGER.info(
             "Learned run-time limit for outlet(s) %s: %s — the run-time cutoff feature is "
             "armed for them",
-            ", ".join(str(self.model.outlet_from_id(k) or k + 1) for k in sorted(new)),
+            ", ".join(self._outlet_label(k) for k in sorted(new)),
             ", ".join(f"{v}s" for _, v in sorted(new.items())),
         )
         self.store(
