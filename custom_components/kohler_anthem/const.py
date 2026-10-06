@@ -472,7 +472,9 @@ RELOAD_IGNORED_DATA_KEYS = frozenset(
 #   showerhead and handshower. The other two codes on that valve are the documented ones,
 #   which is what makes the first credible: two of three positions independently matched
 #   Kohler's own table.
-# * `39`, `38`, `52`, `62` — seen in the capture corpus but **never confirmed against a
+# * `52` — owner-confirmed 2026-10-05 on a K-28211 reporting `11, 52` (zone 1) and `31, 1`
+#   (zone 2) for a showerhead, body sprays, rainhead and handshower.
+# * `39`, `38`, `62` — seen in the capture corpus but **never confirmed against a
 #   fixture**, so they are deliberately absent.
 #
 #   ⚠️ **`62` and `52` were briefly named here (0.5.1) and that was wrong.** They were
@@ -493,6 +495,7 @@ OUTLET_TYPE_NAMES: dict[int, str] = {
     11: "Showerhead",
     21: "Tub Filler",
     31: "Rainhead",
+    52: "Body Sprays",
 }
 
 UI_TEMPERATURE_MIN_F = 92

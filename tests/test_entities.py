@@ -96,10 +96,16 @@ def test_no_unique_id_collisions(coordinator):
 # --------------------------------------------------------------------------- #
 # Naming
 # --------------------------------------------------------------------------- #
-def test_outlets_named_after_their_fixture(coordinator):
+def test_outlets_named_after_their_fixture(coordinator, valve_model):
     names = {e.name for e in collect("switch", coordinator)}
     assert {"Rainhead", "Showerhead", "Handshower"} <= names, sorted(names)
     assert "Shower on" in names
+
+    other_coordinator = make_coordinator([make_valve(valve_model, [52, 21, 1])])
+    other_names = {e.name for e in collect("switch", other_coordinator)}
+    assert {"Body Sprays", "Tub Filler", "Handshower"} <= other_names, sorted(
+        other_names
+    )
 
 
 def test_max_shower_duration_is_unknown_before_it_is_learned(valve_model):
@@ -145,10 +151,18 @@ def test_two_zone_valve_numbers_each_zone(valve_model):
 
 def test_unknown_outlet_type_falls_back_to_position(valve_model):
     """An unconfirmed type code must never be given an invented fixture name."""
+    from custom_components.kohler_anthem.anthem.models import get_valve_model
+
     coordinator = make_coordinator([make_valve(valve_model, [999, 11, 1])])
     names = {e.name for e in collect("switch", coordinator)}
     # Single-zone valve, so no zone number — `Outlet 1`, not `Zone 1 Outlet 1`.
     assert "Outlet 1" in names, sorted(names)
+
+    # Multi-zone valve: unknown/unconfigured outlet falls back to `Outlet <zone>.<outlet>`.
+    multi_model = get_valve_model("K-28211")
+    multi_coordinator = make_coordinator([make_valve(multi_model, [11, 999, 31, 1])])
+    multi_names = {e.name for e in collect("switch", multi_coordinator)}
+    assert "Outlet 1.2" in multi_names, sorted(multi_names)
 
 
 def test_duplicate_fixtures_get_distinct_ids(valve_model):
@@ -3450,7 +3464,7 @@ def test_k28211_hardware_outlet_ids_skip_unused_valve1_slot():
                     },
                     {
                         "outLetId": "1",
-                        "outLetType": "52",
+                        "outLetType": "62",  # purposely unknown outlet type
                         "minimumFlowrate": "12.5",
                         "maximumFlowrate": "50",
                         "maximumRuntime": "1800",
@@ -3499,7 +3513,8 @@ def test_k28211_hardware_outlet_ids_skip_unused_valve1_slot():
     assert holder.outlets_awaiting_run_time == []
     assert holder._zone_limits() == {1: (1800,), 2: (1800,)}
 
-    valve = make_valve(model, [11, 52, 31, 1])
+    # 62 is a purposely unknown outlet type to verify the "Outlet 1.2" fallback
+    valve = make_valve(model, [11, 62, 31, 1])
     valve.gcs_state = state
     valve.outlet_run_times = holder.outlet_run_times
     assert [
