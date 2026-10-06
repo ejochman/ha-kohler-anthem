@@ -2381,7 +2381,7 @@ def test_max_shower_duration_publishes_attributes_without_raising():
     )
     from custom_components.kohler_anthem.select import OutletRunTimeSelect
 
-    for topology in ((3, 0), (2, 0), (3, 3)):
+    for topology in ((3, 0), (2, 0), (2, 2), (3, 3)):
         model = model_for_topology(*topology)
         types = [31, 11, 1, 11, None, 21][: model.total_outlets]
         valve = make_valve(model, types)
@@ -3385,3 +3385,112 @@ def test_a_sparse_zone_message_does_not_blank_the_readings():
     )
     assert state.zones[1].temperature == "106"
     assert state.zones[1].flowrate == "80"
+
+
+def test_k28211_hardware_outlet_ids_skip_unused_valve1_slot():
+    """Each valve body occupies 3 `outLetId` slots (0-2 on Valve1, 3-5 on Valve2).
+
+    On a 4-outlet K-28211 (2+2), `gcsadvancestate` and `READ_GCS_OUTLET_CONFIG_CFG`
+    report `outLetId`s 0 and 1 for Valve1 and **3 and 4** for Valve2 (leaving slot 2
+    unused). Treating `outLetId` as `outlet - 1` mapped `outLetId` 4 to global outlet 5,
+    crashing `OutletRunTimeSelect.extra_state_attributes` with
+    `ValueError: K-28211 has outlets 1-4; got 5` and looking up `outLetId` 2 and 3 for
+    zone 2's fixtures, flow bounds, and run-time limits.
+    """
+    from custom_components.kohler_anthem.anthem.models import get_valve_model
+    from custom_components.kohler_anthem.anthem.state import (
+        GcsState,
+        outlet_limits_from_settings,
+    )
+    from custom_components.kohler_anthem.coordinator import Valve
+    from custom_components.kohler_anthem.entity import outlet_name
+    from custom_components.kohler_anthem.select import OutletRunTimeSelect
+
+    model = get_valve_model("K-28211")
+    assert [
+        model.outlet_id(zone, outlet)
+        for zone in model.zones
+        for outlet in range(1, model.outlets_in_zone(zone) + 1)
+    ] == [0, 1, 3, 4]
+    assert [model.outlet_from_id(i) for i in range(6)] == [1, 2, None, 3, 4, None]
+
+    settings = {
+        "valveSettings": [
+            {
+                "valveIndex": "Valve1",
+                "noOfOutlets": "2",
+                "outletConfigurations": [
+                    {
+                        "outLetId": "0",
+                        "outLetType": "11",
+                        "minimumFlowrate": "12.5",
+                        "maximumFlowrate": "50",
+                        "maximumRuntime": "1800",
+                    },
+                    {
+                        "outLetId": "1",
+                        "outLetType": "52",
+                        "minimumFlowrate": "12.5",
+                        "maximumFlowrate": "50",
+                        "maximumRuntime": "1800",
+                    },
+                ],
+            },
+            {
+                "valveIndex": "Valve2",
+                "noOfOutlets": "2",
+                "outletConfigurations": [
+                    {
+                        "outLetId": "3",
+                        "outLetType": "31",
+                        "minimumFlowrate": "15.0",
+                        "maximumFlowrate": "45",
+                        "maximumRuntime": "1800",
+                    },
+                    {
+                        "outLetId": "4",
+                        "outLetType": "1",
+                        "minimumFlowrate": "15.0",
+                        "maximumFlowrate": "45",
+                        "maximumRuntime": "1800",
+                    },
+                ],
+            },
+        ]
+    }
+    state = GcsState(model=model)
+    state.outlet_limits.update(outlet_limits_from_settings(settings))
+    assert state.zone_flow_limits(1) == (50, 200)
+    assert state.zone_flow_limits(2) == (60, 180)
+
+    class Holder:
+        outlet_run_times = Valve.outlet_run_times
+        outlets_awaiting_run_time = Valve.outlets_awaiting_run_time
+        _zone_limits = Valve._zone_limits
+
+        def __init__(self):
+            self.model = model
+            self.gcs_state = state
+            self._run_times = {0: 1800, 1: 1800, 3: 1800, 4: 1800}
+
+    holder = Holder()
+    assert holder.outlet_run_times == {1: 1800, 2: 1800, 3: 1800, 4: 1800}
+    assert holder.outlets_awaiting_run_time == []
+    assert holder._zone_limits() == {1: (1800,), 2: (1800,)}
+
+    valve = make_valve(model, [11, 52, 31, 1])
+    valve.gcs_state = state
+    valve.outlet_run_times = holder.outlet_run_times
+    assert [
+        outlet_name(valve, zone, outlet)
+        for zone in model.zones
+        for outlet in range(1, model.outlets_in_zone(zone) + 1)
+    ] == ["Showerhead", "Outlet 1.2", "Rainhead 2", "Handshower 2"]
+
+    select = OutletRunTimeSelect(make_coordinator([valve]), valve)
+    assert select.extra_state_attributes["per_outlet"] == {
+        "Showerhead": 30.0,
+        "Outlet 1.2": 30.0,
+        "Rainhead 2": 30.0,
+        "Handshower 2": 30.0,
+    }

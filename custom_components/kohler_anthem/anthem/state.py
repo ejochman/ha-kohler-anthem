@@ -720,8 +720,7 @@ class GcsState:
         Taken from that zone's **first** outlet, matching what the app does — it bounds the
         slider with `outletConfigurations[0]` of each valve rather than combining outlets.
         """
-        first_outlet = 1 if zone == 1 else self.model.outlets_in_zone(1) + 1
-        limits = self.outlet_limits.get(first_outlet - 1)
+        limits = self.outlet_limits.get(self.model.outlet_id(zone, 1))
         if limits is None:
             return FLOW_BYTE_MIN, FLOW_BYTE_MAX
         return limits.minimum_flow_byte, limits.maximum_flow_byte

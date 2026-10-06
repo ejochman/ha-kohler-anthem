@@ -525,16 +525,11 @@ class ZoneOutletSwitch(KohlerValveEntity, SwitchEntity):
         """This outlet's type code, looked up by the valve's own flat 0-based `outLetId`.
 
         `outlet_limits` is keyed by that flat id, while this entity is addressed per zone —
-        the deliberate split described in `ValveModel.outlet_location`. Zone 2's first
-        outlet is flat id `outlets_valve1`, so the conversion has to go through the model
-        rather than assuming the two numbering schemes line up.
+        the deliberate split described in `ValveModel.outlet_id`. Each valve body
+        occupies three `outLetId` slots, so the conversion goes through the model rather
+        than assuming the two numbering schemes line up.
         """
-        model = self._valve.model
-        flat = (
-            (self._outlet - 1)
-            if self._zone == 1
-            else (model.outlets_valve1 + self._outlet - 1)
-        )
+        flat = self._valve.model.outlet_id(self._zone, self._outlet)
         limits = state.outlet_limits.get(flat)
         return None if limits is None else limits.outlet_type
 

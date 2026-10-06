@@ -77,6 +77,37 @@ class ValveModel:
             return 1, outlet - 1
         return 2, outlet - self.outlets_valve1 - 1
 
+    def outlet_id(self, zone: int, outlet: int) -> int:
+        """Map a 1-based ``(zone, outlet)`` to the valve's 0-based ``outLetId``.
+
+        Each valve body occupies three ``outLetId`` slots (0-2 on Valve 1, 3-5 on
+        Valve 2) regardless of how many outlets are physically populated, so Zone 2's
+        first outlet is always ``outLetId`` 3 — even on a 2+2 K-28211 where
+        ``outlets_valve1`` is 2.
+        """
+        count = self.outlets_in_zone(zone)
+        if not 1 <= outlet <= count:
+            raise ValueError(
+                f"{self.sku} zone {zone} has outlets 1-{count}; got {outlet}"
+            )
+        return (zone - 1) * 3 + (outlet - 1)
+
+    def outlet_from_id(self, outlet_id: int) -> int | None:
+        """Map a 0-based hardware ``outLetId`` to a 1-based global outlet, or ``None``.
+
+        Inverts the hardware's fixed 3-slot-per-valve ``outLetId`` numbering (0-2 for
+        zone 1, 3-5 for zone 2) into the contiguous ``1..total_outlets`` numbering
+        expected by :meth:`outlet_location`. Returns ``None`` if ``outlet_id`` falls
+        outside this model's populated outlets.
+        """
+        if outlet_id < 0:
+            return None
+        zone = outlet_id // 3 + 1
+        bit = outlet_id % 3
+        if zone not in self.zones or bit >= self.outlets_in_zone(zone):
+            return None
+        return (bit + 1) if zone == 1 else (self.outlets_valve1 + bit + 1)
+
     def split_outlets(self, outlets: list[bool]) -> tuple[list[bool], list[bool]]:
         """Split per-outlet flags into (valve1 flags, valve2 flags)."""
         if len(outlets) != self.total_outlets:
