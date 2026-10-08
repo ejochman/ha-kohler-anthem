@@ -302,8 +302,13 @@ ENDLESS_SHOWER_ON = (
 # `ENDLESS_SHOWER_MATCH_DURATIONS` stood here until 2026-08-22 — an unconditional "set the
 # controller's Max Shower Duration to the SAME value" warning, printed at every start and
 # every toggle of any dual-product install. Removed on the owner's decision: this integration
-# cannot know whether the durations actually differ (the hub's number is local-API-only, and
-# storing the hub PIN was ruled out), so the nag fired regardless. The advice itself still
+# could not know whether the durations actually differ (the hub's number was believed to be
+# local-API-only, and storing the hub PIN was ruled out), so the nag fired regardless.
+#
+# ✅ **It can know now.** Konnect 3.0.6 reads the controller's duration from the cloud,
+# `hub-configuration` `systemSettings.maxShowerDuration` (minutes). So the warning came back
+# in evidence-based form on 2026-10-07: `ISSUE_DURATION_MISMATCH`, raised only when both
+# numbers are known and differ — see `KohlerAnthemCoordinator._async_check_duration_match`. The advice itself still
 # holds — the valve fires marginally early, the controller marginally late, so equal
 # durations mean the valve's restorable `0x40` always wins — and the mismatch warning that
 # remains is evidence-based: `runtime_cutoff.py` warns when a minute-boundary stop shows the
@@ -335,6 +340,10 @@ ENDLESS_SHOWER_RESTARTED = "Max Shower Duration reached at %s. Restarted the sho
 #
 # Doubles as the `translation_key`, so the text lives in `strings.json` under `issues`.
 ISSUE_NOT_SET_UP = "endless_shower_not_set_up"
+# Raised per controller when its cloud-readable Max Shower Duration differs from a valve's
+# `maximumRunTime` while Endless Shower is on — the configuration `runtime_cutoff` says to fix
+# ("match the two Max Shower Durations"), now detectable rather than assumed.
+ISSUE_DURATION_MISMATCH = "durations_differ"
 
 ENDLESS_SHOWER_NOTHING_TO_RESTORE = (
     "Endless Shower could not restart the shower, because Home Assistant has no record of "
@@ -439,10 +448,16 @@ RELOAD_IGNORED_DATA_KEYS = frozenset(
 # (117.9 °F)**, confirmed 2026-09-10. So the old ceiling silently withheld five degrees the
 # hardware would have accepted, on any valve set higher than the one this was written from.
 #
-# **92-118 °F is exactly what the Konnect app's own slider offers** (owner-confirmed
-# 2026-09-10), and matching the app is the point: those are the numbers on the panel and in
-# the app, and a Home Assistant control with a different range reads as broken rather than
-# cautious.
+# **92-118 °F is exactly what the Konnect app offers for the Max Temperature setting**
+# (owner-confirmed 2026-09-10; Konnect 3.0.6 `gc0/i.java` bounds it 33-48 °C, shown as
+# 92-118 °F). That is what `Max Temperature` and `Default Temperature` use these for.
+#
+# ⚠️ **It is not the zone temperature slider's range, which this used to claim.** Konnect
+# 3.0.6 bounds that slider from a `COLD` stop one degree below the outlet's minimum (sent
+# as 0 °C, full cold) up through `minimumOutletTemperature` (59 °F) to the valve's *current*
+# `maximumOutletTemperature` (`qa0/p.java`, `db0/c.java` `n0()`). The zone control follows
+# that since 2026-10-07 — owner's decision — using `ZONE_TEMPERATURE_MIN_F` below and the
+# valve's live maximum; see `number.ZoneTemperatureNumber`.
 #
 # The bounds were 80-113 before 0.12.0 — both ends invented here rather than taken from the
 # app. The old ceiling was justified as matching `maximumOutletTemperature`, which was a
@@ -460,29 +475,23 @@ RELOAD_IGNORED_DATA_KEYS = frozenset(
 # ---------------------------------------------------------------------------
 # Outlet type codes
 # ---------------------------------------------------------------------------
-# The valve reports a type code per outlet in `outLetType`. These are the codes whose
-# meaning is **confirmed**, not the full set — an unrecognised code is published as a bare
-# number and given no name, because a wrong fixture name is worse than an honest number.
+# The valve reports a type code per outlet in `outLetType`. **This is now the full table** —
+# Konnect 3.0.6's own outlet picker (`db0/c.java` `X()`, duplicated in `mc0/n.java`), the
+# list a user chooses from when setting a valve up, so every code a valve can hold is one of
+# these. Recovered 2026-10-07.
 #
-# Provenance, because it decides how much these can be trusted:
+# It agrees with every code confirmed on hardware before then — 1, 11 and 21 from Kohler's
+# own documentation, 31 on a K-28210 (2026-09-10) and 52 on a K-28211 (2026-10-05) — and it
+# names the three seen in captures but never matched to a fixture: **38 is a Silk rainhead,
+# 39 a Real Rain rainhead, 62 a pair of foot sprays.** (The 0.5.1 mistake of naming 52 and
+# 62 by lining one install's outlet order up against another's is still the thing never to
+# do; these come from the app's table, not from inference.)
 #
-# * `1`, `11`, `21` — documented in `docs/hub/cloud_api.md` §"Outlet position → physical
-#   outlet", which also warns that other codes are install-specific.
-# * `31` — owner-confirmed 2026-09-10 on a K-28210 reporting `31, 11, 1` for a rainhead,
-#   showerhead and handshower. The other two codes on that valve are the documented ones,
-#   which is what makes the first credible: two of three positions independently matched
-#   Kohler's own table.
-# * `52` — owner-confirmed 2026-10-05 on a K-28211 reporting `11, 52` (zone 1) and `31, 1`
-#   (zone 2) for a showerhead, body sprays, rainhead and handshower.
-# * `39`, `38`, `62` — seen in the capture corpus but **never confirmed against a
-#   fixture**, so they are deliberately absent.
-#
-#   ⚠️ **`62` and `52` were briefly named here (0.5.1) and that was wrong.** They were
-#   inferred by assuming a second install's outlets sat in the same id order as the corpus
-#   reference machine's. The install that inference was built on turned out to report
-#   `31, 11, 1`, so the corpus codes belong to different fixtures than assumed. Codes are
-#   only added here on a direct owner report of *that* valve's own numbers — never by
-#   lining two installs up against each other.
+# Names are the fixture as the app titles it. Where the picker distinguishes one fixture from
+# several (`Showerhead` / `Showerheads`, `Single` / `Multiple` body or foot sprays), the
+# plural is kept, because "Body Sprays" switches more than one head. Rainhead and body-spray
+# *variants* (Katalyst, Silk, Massage…) are the same fixture to switch, so they share a name
+# and the variant is published separately — see `OUTLET_TYPE_VARIANTS`.
 #
 # **This is a label, not behaviour.** The valve derives no flow envelope from the type; the
 # controller does. Nothing in this integration reads these names to decide anything.
@@ -490,16 +499,59 @@ RELOAD_IGNORED_DATA_KEYS = frozenset(
 # The Konnect app's own outlet names are *not* here because they are not transmitted: no
 # name string appears anywhere in the captured API surface, so a rename in the app cannot
 # be read back. These are fixture types, which is the closest the hardware gets.
+#
+# ⚠️ Naming a code renames its switch, and the switch's unique id follows its name. An
+# existing position-named switch (`Outlet 1.3`) is migrated to its fixture id in place, so
+# its entity id and automations survive — see `switch._async_migrate_outlet_unique_ids`.
 OUTLET_TYPE_NAMES: dict[int, str] = {
     1: "Handshower",
     11: "Showerhead",
+    12: "Showerheads",
     21: "Tub Filler",
+    30: "Not Plumbed",
     31: "Rainhead",
+    32: "Rainhead",
+    33: "Rainhead",
+    34: "Rainhead",
+    35: "Rainhead",
+    36: "Rainhead",
+    37: "Rainhead",
+    38: "Rainhead",
+    39: "Rainhead",
+    51: "Body Spray",
     52: "Body Sprays",
+    53: "Body Spray",
+    61: "Foot Spray",
+    62: "Foot Sprays",
+}
+
+#: The variant the app shows beneath the fixture name, for codes that have one. Published as
+#: the outlet switch's `outlet_variant` attribute; never part of a name or an id.
+OUTLET_TYPE_VARIANTS: dict[int, str] = {
+    31: "Katalyst",
+    32: "Cascade",
+    33: "Kinetic",
+    34: "Rain Curtain",
+    35: "Laminar",
+    36: "Massage (Wave)",
+    37: "Hydro Massage",
+    38: "Silk",
+    39: "Real Rain",
+    51: "Single",
+    52: "Multiple",
+    53: "Massage (Wave)",
+    61: "Single",
+    62: "Multiple",
 }
 
 UI_TEMPERATURE_MIN_F = 92
 UI_TEMPERATURE_MAX_F = 118
+
+#: The zone temperature control's floor when the valve has not reported its own minimum —
+#: the `minimumOutletTemperature` of 15.0 °C every captured outlet carries, and the value the
+#: app forces on every outlet-config write. The control's lowest step is one below this, and
+#: means full cold, as the app's `COLD` stop does.
+ZONE_TEMPERATURE_MIN_F = 59
 
 # ---------------------------------------------------------------------------
 # Writable outlet configuration — the Konnect app's own three settings
@@ -537,8 +589,10 @@ UI_DEFAULT_TEMPERATURE_MIN_F = 59
 # a shower from Home Assistant would have produced a trickle, with nothing in the UI to
 # explain why or to fix it.
 #
-# 100% is the only defensible default: it is what the Konnect app pins favorites to, and it
-# is the one value a user who has no flow control cannot be surprised by.
+# 100% is the only defensible default: it is the one value a user who has no flow control
+# cannot be surprised by. (This used to add "it is what the Konnect app pins favorites to".
+# Konnect 3.0.6 does not: a favorite takes the outlet's own `defaultFlowrate`, `db0/c.java`.
+# The reasoning above stands without it.)
 DEFAULT_FLOW_PERCENT = 100.0
 
 # ---------------------------------------------------------------------------
@@ -584,9 +638,6 @@ SERVICE_SEND_VALVE_HEX = "send_valve_hex"
 # ONE complete write. Added 2026-09-06 after GitHub issue #1 showed that every UI-built
 # automation ends up as two valve commands back to back, which the valve cannot take.
 SERVICE_CUSTOM_SHOWER = "custom_shower"
-#: Exploratory: calls the undocumented `gcs-usage` endpoint with candidate query strings and
-#: writes what each returns to a file. See `anthem/const.py:GCS_USAGE`.
-SERVICE_PROBE_USAGE = "probe_usage"
 
 # ---------------------------------------------------------------------------
 # Warmup auto-restore

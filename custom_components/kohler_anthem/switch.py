@@ -40,6 +40,7 @@ from .const import (
     ENDLESS_SHOWER_NOT_SET_UP,
     ENDLESS_SHOWER_ON,
     OUTLET_TYPE_NAMES,
+    OUTLET_TYPE_VARIANTS,
     SHOWER_ON_PRESET_ID,
     WARMUP_AUTO_RESTORE_DELAY_SECONDS,
     WARMUP_AUTO_RESTORE_NO_TARGET,
@@ -93,6 +94,61 @@ def _async_purge_valve_only_warmup_restore(
             )
 
 
+def _position_name(valve: Valve, zone: int, outlet: int) -> str:
+    """The name `outlet_name` falls back to when the fixture is unknown — `Outlet 1.3`."""
+    if len(valve.model.zones) > 1:
+        return f"Outlet {zone}.{outlet}"
+    return f"Outlet {outlet}"
+
+
+@callback
+def _async_migrate_outlet_unique_ids(
+    hass: HomeAssistant, entry: ConfigEntry, valve: Valve
+) -> None:
+    """Move a position-named outlet switch onto its fixture id, keeping its entity id.
+
+    An outlet's unique id follows its name (`ZoneOutletSwitch`), and its name follows the
+    fixture once the valve's `outLetType` maps to one. So a switch first registered as
+    `Outlet 1.3` — because the type had not arrived yet, or (before 2026-10-07) because the
+    code was not in `OUTLET_TYPE_NAMES` — would come back as a *new* entity named `Foot
+    Sprays`, orphaning the old one and every automation pointing at it.
+
+    Rewriting the registry row's unique id instead keeps its entity id, its customisations
+    and the automations; only the displayed name moves. Skipped when the fixture id is
+    already registered, so a second outlet can never be folded onto the first.
+
+    **Cleanup, so it never fails setup** — same reasoning as the warmup purge above.
+    """
+    try:
+        registry = er.async_get(hass)
+        rows = {
+            row.unique_id: row
+            for row in er.async_entries_for_config_entry(registry, entry.entry_id)
+            if row.domain == "switch"
+        }
+    except Exception:  # Cosmetic cleanup; never worth failing setup over.
+        _LOGGER.debug("Entity registry unavailable; outlet ids left as they are")
+        return
+    for zone in valve.model.zones:
+        for outlet in range(1, valve.model.outlets_in_zone(zone) + 1):
+            new_id = f"{valve.device_id}_{slug(outlet_name(valve, zone, outlet))}"
+            old_id = f"{valve.device_id}_{slug(_position_name(valve, zone, outlet))}"
+            if new_id == old_id or new_id in rows or old_id not in rows:
+                continue
+            row = rows.pop(old_id)
+            try:
+                registry.async_update_entity(row.entity_id, new_unique_id=new_id)
+            except Exception:  # A clash or a registry error: leave the row alone.
+                _LOGGER.debug("Could not migrate %s to %s", row.entity_id, new_id)
+                continue
+            rows[new_id] = row
+            _LOGGER.info(
+                "%s now names its fixture (%s); entity id kept",
+                row.entity_id,
+                outlet_name(valve, zone, outlet),
+            )
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -122,6 +178,7 @@ async def async_setup_entry(
         else:
             _async_purge_valve_only_warmup_restore(hass, entry, valve)
         entities.append(ValveReportLogSwitch(coordinator, valve))
+        _async_migrate_outlet_unique_ids(hass, entry, valve)
         entities.extend(
             ZoneOutletSwitch(coordinator, valve, zone, outlet)
             for zone in model.zones
@@ -134,6 +191,10 @@ async def async_setup_entry(
             HubSystemSwitch(coordinator, controller),
             ControllerReportLogSwitch(coordinator, controller),
         ]
+        # Only where a steam generator is attached — the same `parts` gate as the Steam
+        # binary sensor. A controller with no steam has nothing for `steamcontrol` to run.
+        if controller.capabilities.steam:
+            entities.append(HubSteamSwitch(coordinator, controller))
 
     async_add_entities(entities)
 
@@ -507,18 +568,19 @@ class ZoneOutletSwitch(KohlerValveEntity, SwitchEntity):
         # The valve's own type code for this outlet — 62, 52, 1, 11, 39, 21 and so on. It
         # is the only per-outlet identity the hardware reports, and it is what tells a
         # handshower from a tub filler on an install whose outlets are otherwise just
-        # numbers. Published raw and unmapped: only three codes are documented and the
-        # rest are install-specific, so naming them here would be invention. Absent until
-        # the valve announces this outlet — the messages arrive one at a time, unprompted.
+        # numbers. Published raw beside its name. Absent until the valve announces this
+        # outlet — the messages arrive one at a time, unprompted.
         outlet_type = self._outlet_type(state)
         if outlet_type is not None:
             attributes["outlet_type"] = outlet_type
-            # Only for codes whose meaning is confirmed — see `OUTLET_TYPE_NAMES`. An
-            # unrecognised code leaves this key absent rather than inventing a fixture
-            # name, so a missing name reads as "not known" and never as a wrong answer.
+            # From the app's own table — see `OUTLET_TYPE_NAMES`. A code outside it (none
+            # is known) leaves these keys absent rather than inventing a fixture name.
             name = OUTLET_TYPE_NAMES.get(outlet_type)
             if name is not None:
                 attributes["outlet_type_name"] = name
+            variant = OUTLET_TYPE_VARIANTS.get(outlet_type)
+            if variant is not None:
+                attributes["outlet_variant"] = variant
         return attributes
 
     def _outlet_type(self, state: Any) -> int | None:
@@ -718,6 +780,76 @@ class HubSystemSwitch(KohlerControllerEntity, SwitchEntity):
         self.async_write_ha_state()
         try:
             await action
+        except Exception:
+            self._optimistic = None
+            self.async_write_ha_state()
+            raise
+
+
+class HubSteamSwitch(KohlerControllerEntity, SwitchEntity):
+    """The controller's steam generator, at its own default temperature and time.
+
+    ``steamcontrol {steamOnOff}`` — the steam twin of the Shower switch's ``valvecontrol``,
+    and the same thing the Konnect app's "Steam start" card sends. There is no temperature
+    or duration in the command: the controller runs ``steamSettings.defaultTemperature`` for
+    ``defaultTime``, set in the app or on the controller.
+
+    **Added 2026-10-07, app-confirmed but never run against hardware by this integration** —
+    no steam generator is attached to the reference system. The app refuses to start steam
+    while the shower runs, and so does this (`KohlerAnthemCoordinator.async_set_hub_steam`).
+
+    ``is_on`` reads ``STEAM_STS``; a generator running its self-clean (``POWERCLEAN``)
+    reads off with ``power_clean`` true, because it is not steaming for anyone and should
+    not be stood in.
+    """
+
+    _attr_name = "Steam"
+    _attr_icon = "mdi:weather-fog"
+
+    def __init__(
+        self, coordinator: KohlerAnthemCoordinator, controller: Controller
+    ) -> None:
+        super().__init__(coordinator, controller)
+        # Distinct from the Steam binary sensor's `_steam`, which stays for existing
+        # automations; this is the control, that is the plain reading.
+        self._attr_unique_id = f"{self._device_id}_steam_control"
+        self._optimistic: bool | None = None
+
+    @property
+    def is_on(self) -> bool | None:
+        if self._optimistic is not None:
+            return self._optimistic
+        state = self._state
+        return None if state is None else state.steam_on
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        state = self._state
+        settings = self._controller.settings
+        attributes: dict[str, Any] = {
+            "default_temperature": settings.steam_default_temperature,
+            "default_time": settings.steam_default_time,
+        }
+        if state is not None:
+            attributes["power_clean"] = state.steam_powerclean
+        return attributes
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._optimistic = None
+        super()._handle_coordinator_update()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self._async_set(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._async_set(False)
+
+    async def _async_set(self, target: bool) -> None:
+        self._optimistic = target
+        self.async_write_ha_state()
+        try:
+            await self.coordinator.async_set_hub_steam(self._controller, target)
         except Exception:
             self._optimistic = None
             self.async_write_ha_state()

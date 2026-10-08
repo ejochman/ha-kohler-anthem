@@ -21,7 +21,9 @@ from .client import KohlerClient, KohlerError
 from .const import (
     GCS_CONTROL_PRESET,
     GCS_CREATE_PRESET,
+    GCS_RESET_RESTART,
     GCS_SOLOWRITESYSTEM,
+    GCS_VALVE_RESET,
     GCS_WARMUP,
     GCS_WRITE_OUTLET_CONFIG,
     GCS_WRITE_PRESET,
@@ -48,6 +50,11 @@ _LOGGER = logging.getLogger(__name__)
 # The payload carries eight valve slots. Only the first two are ever populated; the rest
 # must still be present and zeroed.
 SECONDARY_SLOTS = tuple(f"secondaryValve{n}" for n in range(2, 8))
+
+#: What a preset sends for a valve it does not use. Konnect 3.0.6 fills unused `valve2`..
+#: `valve8` with this on both `createpreset` and `writepreset` (`mc0/n.java`); this
+#: integration sent `""` until 2026-10-07 on a misreading that the app did.
+UNUSED_PRESET_WORD = "000000"
 
 
 @dataclass(frozen=True)
@@ -124,9 +131,10 @@ def plan_preset_timer(
         # **Validate before echoing.** This word came from the cloud and is about to be
         # written back verbatim, because `writepreset` replaces the record whole. A
         # malformed or scalding word is dropped rather than passed through — dropping it
-        # sends an empty field for that valve, which is what `_valve_fields` already sends
-        # for a valve the preset does not use, so the failure mode is a preset that stops
-        # driving one valve rather than one that runs it too hot.
+        # sends the unused-valve word for that valve, which is what `_valve_fields` already
+        # sends for a valve the preset does not use, so the failure mode is a preset that
+        # stops driving one valve rather than one that runs it too hot. The ceiling admits
+        # every value the Konnect app can store; see `PRESET_ECHO_MAX_TENTHS`.
         try:
             word = check_preset_word(word)
         except ValveHexError:
@@ -240,6 +248,24 @@ class GcsDevice:
         valve1, valve2 = stop_pair(self.model, celsius)
         return await self.async_write_valves(valve1, valve2)
 
+    async def async_restart(self) -> Any:
+        """Reboot the valve — the app's Settings → Restart Product.
+
+        ``valvereset`` with ``reset: "productRestart"``, the exact body Konnect 3.0.6 sends
+        (``AnthemValveResetRequestModel``). The valve drops any running water while it
+        reboots. A valve that has lost its cloud link never receives this, so it cannot be
+        used to revive one.
+        """
+        payload = {
+            "deviceId": self.device_id,
+            "sku": SKU_GCS,
+            "tenantId": self._client.tenant_id,
+            "reset": GCS_RESET_RESTART,
+        }
+        return await self._client.async_request(
+            "POST", GCS_VALVE_RESET, json_body=payload
+        )
+
     async def async_pause(self, temperature: float | None = None) -> Any:
         """Pause both valves, holding the session open (mask ``0x40``)."""
         celsius = (
@@ -278,6 +304,12 @@ class GcsDevice:
         and then ignores — the reason presets "returned success but nothing happened", and
         why a ``solowritesystem`` follow-up was bolted on to compensate. Confirmed live:
         the library's body left ``presetOrExperienceId`` at ``'0'`` and moved no valve.
+
+        **Experiences start the same way.** Konnect 3.0.6's current screens send this exact
+        body for an experience id (17 and up) as for a preset; only the older screens used
+        ``startpreset {presetOrExperienceId}``. Experiences carry no valve words of their
+        own — the valve runs the program from firmware — so there is nothing else to send.
+        App-confirmed, not yet live-verified on this integration.
         """
         payload = {
             "deviceId": self.device_id,
@@ -297,12 +329,13 @@ class GcsDevice:
         valves: dict[int, str],
         *,
         time_seconds: int = 1800,
-        volume: str = "",
+        volume: str = "0",
     ) -> Any:
         """Overwrite an existing preset.
 
         ``valves`` maps a 1-based valve number to a **3-byte preset word** (see
-        :func:`~.valve_hex.encode_preset_word`). Unlisted valves are sent empty.
+        :func:`~.valve_hex.encode_preset_word`). Unlisted valves are sent as
+        :data:`UNUSED_PRESET_WORD`, and ``volume`` defaults to the ``"0"`` the app sends.
 
         Three shapes make this silently no-op while still returning success: posting to
         ``createpreset`` (which makes a new preset instead of editing), omitting the
@@ -336,9 +369,18 @@ class GcsDevice:
     ) -> Any:
         """Replace one outlet's configuration record. **This writes a scald limit.**
 
-        `writeoutletconfig` has no partial form: the body is all eleven keys, and whatever
-        is sent becomes the record. So this takes the outlet's *current* limits and
+        `writeoutletconfig` has no partial form: the body is all **twelve** keys, and
+        whatever is sent becomes the record. So this takes the outlet's *current* limits and
         overrides only the named fields — every other value is echoed back exactly as read.
+
+        The twelve are the ten below plus ``maxVolume`` and ``purge``, which Konnect 3.0.6
+        always sends (``GcsOutletConfigurationsModel``) and this integration omitted until
+        2026-10-07. Neither is read back over MQTT on any captured install, so each is echoed
+        when the valve has reported it and otherwise sent as the app sends it: ``maxVolume``
+        ``"0"``, ``purge`` ``""``. ``maxVolume`` is most likely the bath-fill volume limit.
+        (The app also forces ``minimumOutletTemperature`` 150 and ``minimumFlowrate`` 16 on
+        every write; this echoes what was read instead, which on every captured install is
+        the same 150 and 16.)
 
         🚨 **Three ways to silently corrupt a safety setting**, all documented in
         `docs/gcs/api.md` §1c and all guarded here:
@@ -348,7 +390,7 @@ class GcsDevice:
           written at all — that is what the `None` check below refuses.
         * **The write keys are not the read keys.** `maximumRuntime`, `maximumFlowrate`,
           `minimumFlowrate`, `defaultFlowrate` — lowercase `t`/`r` on the write side,
-          capitalised on the MQTT read side. Four of eleven fields would vanish.
+          capitalised on the MQTT read side. Four of twelve fields would vanish.
         * **The wrong scale.** The body wants wire units: tenths of °C and flow bytes. REST
           reports display units, which is why `OutletLimits` normalises on the way in and
           this sends what it holds without converting again.
@@ -384,7 +426,8 @@ class GcsDevice:
         }
         # **Refuse rather than guess.** Every field here is part of the record being
         # replaced; a None is something this integration has not read, and inventing it
-        # would change a setting the caller never asked to touch.
+        # would change a setting the caller never asked to touch. The two app defaults
+        # below are the exception, and only because they are what the app itself writes.
         missing = sorted(key for key, value in record.items() if value is None)
         if missing:
             raise KohlerError(
@@ -403,7 +446,9 @@ class GcsDevice:
             "tenantId": self._client.tenant_id,
             # Every value is a string on the wire.
             "gcsOutletConfigControlModel": {
-                key: str(value) for key, value in record.items()
+                **{key: str(value) for key, value in record.items()},
+                "maxVolume": "0" if limits.max_volume is None else limits.max_volume,
+                "purge": "" if limits.purge is None else limits.purge,
             },
         }
         return await self._client.async_request(
@@ -454,7 +499,7 @@ class GcsDevice:
         valves: dict[int, str],
         *,
         time_seconds: int = 1800,
-        volume: str = "",
+        volume: str = "0",
     ) -> Any:
         """Create a new preset. Flat body, no wrapper and no ``presetId``."""
         payload = {
@@ -472,11 +517,11 @@ class GcsDevice:
 
     @staticmethod
     def _valve_fields(valves: dict[int, str]) -> dict[str, str]:
-        """Build valve1..valve8 fields. Empty string for unused, per the app's own body."""
+        """Build valve1..valve8 fields, with :data:`UNUSED_PRESET_WORD` for unused ones."""
         fields = {}
         for number in range(1, 9):
             word = valves.get(number)
-            fields[f"valve{number}"] = word.lower() if word else ""
+            fields[f"valve{number}"] = word.lower() if word else UNUSED_PRESET_WORD
         return fields
 
     # ------------------------------------------------------------------ #
@@ -490,7 +535,8 @@ class GcsDevice:
 
         The four fields below are the whole request model
         (``AnthemWriteWarmUpRequestModel``): there is no duration, no delay, no outlet list
-        and no temperature. Re-confirmed against Konnect Android 3.0.1 on 2026-08-20.
+        and no temperature. Re-confirmed against Konnect Android 3.0.1 on 2026-08-20 and
+        3.0.6 on 2026-10-07.
 
         ⚠️ **``warmUp`` is required, and omitting it fails silently** — Kohler's cloud
         returns 200 and the device ignores the request. That is the single most common bug in

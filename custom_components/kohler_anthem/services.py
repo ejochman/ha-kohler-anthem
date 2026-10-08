@@ -29,10 +29,7 @@ not model.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import voluptuous as vol
@@ -60,10 +57,9 @@ from .const import (
     DEFAULT_FLOW_PERCENT,
     DOMAIN,
     SERVICE_CUSTOM_SHOWER,
-    SERVICE_PROBE_USAGE,
     SERVICE_SEND_VALVE_HEX,
     UI_TEMPERATURE_MAX_F,
-    UI_TEMPERATURE_MIN_F,
+    ZONE_TEMPERATURE_MIN_F,
 )
 from .coordinator import KohlerAnthemCoordinator, Valve
 
@@ -106,14 +102,6 @@ SEND_VALVE_HEX_SCHEMA = vol.Schema(
         # `vol.Maybe` because the UI submits "" for a touched-then-cleared optional text
         # field, which would otherwise fail the regex instead of meaning "closed".
         vol.Optional(ATTR_ZONE2_HEX): vol.Any("", None, _HEX_WORD),
-    }
-)
-
-#: Only the valve picker — the probe's candidates are fixed in code, because the point is to
-#: try a known list and record the answers, not to hand-type query strings.
-PROBE_USAGE_SCHEMA = vol.Schema(
-    {
-        vol.Optional(ATTR_DEVICE_ID): vol.Any(None, cv.string),
     }
 )
 
@@ -195,7 +183,7 @@ _FIELD_ZONE1_TEMPERATURE = {
     "example": 104,
     "selector": {
         "number": {
-            "min": 92,
+            "min": 59,
             "max": 118,
             "step": 1,
             "unit_of_measurement": "°F",
@@ -210,7 +198,7 @@ _FIELD_ZONE2_TEMPERATURE = {
     "example": 104,
     "selector": {
         "number": {
-            "min": 92,
+            "min": 59,
             "max": 118,
             "step": 1,
             "unit_of_measurement": "°F",
@@ -298,15 +286,19 @@ _SECTION_NAMES = {
 
 
 def _temperature_bounds(unit: str) -> tuple[float, float, str]:
-    """The slider's range in the account's unit, as the number entity computes it.
+    """The form's range in the account's unit: 59-118 °F.
 
-    Same maths as `ZoneTemperatureNumber`: the bounds are stated in Fahrenheit
-    (`UI_TEMPERATURE_MIN_F` / `UI_TEMPERATURE_MAX_F`) and rounded for a Celsius account.
+    The zone slider's range less its Cold stop. The floor is `ZONE_TEMPERATURE_MIN_F`, the
+    minimum every outlet carries; the top is `UI_TEMPERATURE_MAX_F`, the highest the app lets
+    Max Temperature go — fixed here because one form serves every valve, and each valve
+    clamps to its own scald limit anyway. **Cold is deliberately not reachable from here**:
+    a YAML caller typing 0 should get an error, not a cold shower. `send_valve_hex` and the
+    zone slider's Cold stop are the ways to ask for it.
     """
     if unit.lower().startswith("f"):
-        return float(UI_TEMPERATURE_MIN_F), float(UI_TEMPERATURE_MAX_F), "°F"
+        return float(ZONE_TEMPERATURE_MIN_F), float(UI_TEMPERATURE_MAX_F), "°F"
     return (
-        float(round(unit_to_celsius(UI_TEMPERATURE_MIN_F, "Fahrenheit"))),
+        float(round(unit_to_celsius(ZONE_TEMPERATURE_MIN_F, "Fahrenheit"))),
         float(round(unit_to_celsius(UI_TEMPERATURE_MAX_F, "Fahrenheit"))),
         "°C",
     )
@@ -471,9 +463,9 @@ async def _async_custom_shower(call: ServiceCall) -> ServiceResponse:
     """Handle `kohler_anthem.custom_shower`.
 
     Builds both words from the form and hands them to the coordinator as one write. Each
-    temperature is checked against the same bounds the temperature sliders offer, in the
-    account's unit, so a YAML caller cannot send the valve full cold by typing 0. Zone 2's
-    temperature follows zone 1's when it is not given.
+    temperature is checked against `_temperature_bounds`, in the account's unit, so a YAML
+    caller cannot send the valve full cold by typing 0. Zone 2's temperature follows zone
+    1's when it is not given.
     """
     valve = _resolve_valve(call.hass, call.data.get(ATTR_DEVICE_ID))
     unit = valve.temperature_unit
@@ -508,125 +500,10 @@ async def _async_custom_shower(call: ServiceCall) -> ServiceResponse:
     return {**result, ATTR_KEEP_ON: keep_on}
 
 
-#: `gcs-usage` query strings — **the real contract, plus a date-format fallback.**
-#:
-#: Recovered from the Konnect APK's Retrofit annotations, not guessed:
-#: `getAnthemWaterUsageData` on `com/kohler/hermoth/data/network/DeviceApiCall` declares
-#: `@GET /devices/api/{version}/device-management/gcs-usage/{deviceId}` with exactly three
-#: `@Query` parameters — **`FromDate`, `ToDate`, `Interval`** — and no headers or body.
-#: `Interval` takes `WEEK`, `MONTH` or `YEAR`, uppercase, from the const-strings in
-#: `WaterUsageViewModel`.
-#:
-#: **They are PascalCase, and that is why the first fifteen candidates all failed.** Every
-#: one used camelCase, lowercase or a wrong name, so none was ever recognised as a parameter
-#: at all — which is exactly why a bare call and a fully-formed date range returned the same
-#: generic 400.
-#:
-#: The one element the decompile did not pin is the date format, so three are tried. The
-#: rest is verified, and a failure here is informative rather than another guess.
-_USAGE_ATTEMPTS: tuple[tuple[str, str], ...] = (
-    ("MONTH iso", "FromDate={from}&ToDate={to}&Interval=MONTH"),
-    ("YEAR iso", "FromDate={from}&ToDate={to}&Interval=YEAR"),
-    ("WEEK iso", "FromDate={from}&ToDate={to}&Interval=WEEK"),
-    # **DAY, over a short range.** Never tried before 2026-09-11, which is why "MONTH may be
-    # the only interval a GCS valve supports" was only ever a maybe: YEAR and WEEK were
-    # rejected, DAY was simply never asked. A daily figure is the one thing `gcs-usage`
-    # cannot currently give ("Water Used Today"), so this is the call that settles it.
-    #
-    # A short range on purpose: 400 days of daily buckets is a large response for a probe,
-    # and if DAY works at all it works on 14 days.
-    ("DAY iso (14d)", "FromDate={from_recent}&ToDate={to}&Interval=DAY"),
-    # **WEEK again, over a short range.** WEEK was rejected on 2026-09-10 — but over a
-    # 400-day window, which asks for ~57 weekly buckets against the 13 monthly ones that
-    # succeeded. A server that caps result rows would answer the same generic 400 to a
-    # perfectly valid interval, so that test could not tell "WEEK is unsupported" apart from
-    # "that range is too long for WEEK". Re-asked over 90 days, which is 13 buckets — the
-    # same count MONTH is known to serve.
-    ("WEEK iso (90d)", "FromDate={from_quarter}&ToDate={to}&Interval=WEEK"),
-    # **And shorter still.** The owner confirmed 2026-09-11 that the Konnect app *does* show
-    # weekly stats, so the endpoint serves WEEK and the 400 came from something else in the
-    # request. The app's week tab shows a handful of weeks, not 57, so if a row cap is the
-    # cause it may bite well below 90 days. 28 days is 4 buckets — about what a week tab
-    # displays, and the smallest range that still proves a series came back.
-    ("WEEK iso (28d)", "FromDate={from_month}&ToDate={to}&Interval=WEEK"),
-    # Same contract, other date formats from the app's string pool.
-    ("MONTH iso8601-Z", "FromDate={from_z}&ToDate={to_z}&Interval=MONTH"),
-    ("MONTH us", "FromDate={from_us}&ToDate={to_us}&Interval=MONTH"),
-    # A bare call, kept as the control: it should still be the generic 400, and having it
-    # beside a working call is what proves the parameters were the difference.
-    ("bare (control)", ""),
-)
-
-
-def usage_probe_substitutions(now: datetime | None = None) -> dict[str, str]:
-    """The placeholder values every `_USAGE_ATTEMPTS` candidate is rendered with.
-
-    Exported so the test that checks every candidate renders uses *these* values rather than
-    its own copy: a placeholder added to a candidate and not here is a `KeyError` against
-    live hardware, and a duplicated dict in the test cannot catch that.
-    """
-    now = now or datetime.now(UTC)
-    start = now - timedelta(days=400)
-    return {
-        "from": start.date().isoformat(),
-        "to": now.date().isoformat(),
-        "from_z": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "to_z": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "from_us": start.strftime("%m-%d-%Y"),
-        "to_us": now.strftime("%m-%d-%Y"),
-        # Short windows for the DAY and WEEK attempts — see `_USAGE_ATTEMPTS`.
-        "from_recent": (now - timedelta(days=14)).date().isoformat(),
-        "from_quarter": (now - timedelta(days=90)).date().isoformat(),
-        "from_month": (now - timedelta(days=28)).date().isoformat(),
-    }
-
-
-async def _async_probe_usage(call: ServiceCall) -> ServiceResponse:
-    """Try the undocumented `gcs-usage` endpoint and report what each candidate returns.
-
-    Exploratory by design: this exists to learn a contract nobody has recorded, so it makes
-    a handful of read-only GETs and reports statuses. It changes nothing on the valve.
-
-    The result is returned to the caller *and* written to a file, because a service response
-    in Developer Tools is easy to lose and this is evidence worth keeping.
-    """
-    valve = _resolve_valve(call.hass, call.data.get(ATTR_DEVICE_ID))
-    now = datetime.now(UTC)
-    substitutions = usage_probe_substitutions(now)
-    attempts = [
-        (label, query.format(**substitutions)) for label, query in _USAGE_ATTEMPTS
-    ]
-
-    results = await valve.client.async_probe_usage(valve.device_id, attempts)
-
-    # Written where the report log already lives, so there is one place to look for evidence
-    # and one thing to attach to an issue.
-    directory = call.hass.config.path("custom_components", DOMAIN, "reports")
-    path = os.path.join(directory, f"usage_probe_{now.strftime('%Y%m%dT%H%M%SZ')}.json")
-
-    def _write() -> None:
-        os.makedirs(directory, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(results, handle, indent=2, ensure_ascii=False)
-
-    try:
-        await call.hass.async_add_executor_job(_write)
-    except OSError as err:  # pragma: no cover - the response still carries the findings
-        _LOGGER.warning("Could not write the usage probe to %s: %s", path, err)
-        path = ""
-
-    succeeded = [record["label"] for record in results if record.get("ok")]
-    _LOGGER.info(
-        "gcs-usage probe: %d candidates tried, %d succeeded (%s)",
-        len(results),
-        len(succeeded),
-        ", ".join(succeeded) if succeeded else "none",
-    )
-    return {
-        "written_to": path,
-        "succeeded": succeeded,
-        "results": results,
-    }
+# `probe_usage` lived here until 2026-10-07: an exploratory action that tried candidate
+# query strings against `gcs-usage` because its contract was unknown. Konnect 3.0.6 settled
+# the contract (`anthem/const.py` `GCS_USAGE`), the integration already reads it, and the
+# action went with the question it existed to answer.
 
 
 def async_register_services(
@@ -667,14 +544,6 @@ def async_register_services(
     _async_describe_service(
         hass, any(model.uses_valve2 for model in models), len(models) > 1
     )
-    if not hass.services.has_service(DOMAIN, SERVICE_PROBE_USAGE):
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_PROBE_USAGE,
-            _async_probe_usage,
-            schema=PROBE_USAGE_SCHEMA,
-            supports_response=SupportsResponse.OPTIONAL,
-        )
     if not hass.services.has_service(DOMAIN, SERVICE_CUSTOM_SHOWER):
         hass.services.async_register(
             DOMAIN,
@@ -694,14 +563,12 @@ def async_unregister_services(hass: HomeAssistant) -> None:
     Tolerates never having been registered — a HUB-only account gets here having skipped
     registration entirely.
     """
-    # Every service registered above belongs here. `probe_usage` was missed when it was
-    # added in 0.7.7, so it outlived the last unload: the action stayed in the registry with
-    # nothing behind it, and calling it reported "no Anthem valve on this account" — an error
-    # about the wrong thing entirely — instead of simply not existing.
+    # Every service registered above belongs here. One that is missed outlives the last
+    # unload — as `probe_usage` did in 0.7.7 — and stays in the registry with nothing
+    # behind it, failing with an error about the wrong thing instead of simply not existing.
     for service in (
         SERVICE_SEND_VALVE_HEX,
         SERVICE_CUSTOM_SHOWER,
-        SERVICE_PROBE_USAGE,
     ):
         if hass.services.has_service(DOMAIN, service):
             hass.services.async_remove(DOMAIN, service)

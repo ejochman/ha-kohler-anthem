@@ -55,6 +55,7 @@ from .const import (
     UI_DEFAULT_TEMPERATURE_MIN_F,
     UI_TEMPERATURE_MAX_F,
     UI_TEMPERATURE_MIN_F,
+    ZONE_TEMPERATURE_MIN_F,
 )
 from .coordinator import KohlerAnthemCoordinator, Valve
 from .entity import KohlerValveEntity, ZoneWordEntity, zone_label
@@ -88,21 +89,35 @@ class ZoneNumberBase(ZoneWordEntity, NumberEntity):
     `__init__` and `_word` come from `ZoneWordEntity`.
     """
 
-    # SLIDER rather than BOX: the range is now narrow enough (92-118 °F) that dragging is
-    # quicker than typing, which was not true of the old 32-119 °F span.
+    # SLIDER rather than BOX, as the app's own control is a slider. The zone range is
+    # 58-118 °F at most (Cold, then 59 up to the valve's maximum), narrow enough to drag.
     _attr_mode = NumberMode.SLIDER
 
 
 class ZoneTemperatureNumber(ZoneNumberBase):
-    """Temperature setpoint for one zone.
+    """Temperature setpoint for one zone — **the Konnect app's slider, Cold stop included.**
 
     Presented in the account's unit as a whole number, with 0.1 °C resolution underneath, so
     a whole degree Fahrenheit is always representable.
 
-    The bottom of the range is a real setting, not a rounding artefact: **0 °C / 32 °F means
-    "full cold"** — the valve stops mixing hot and delivers whatever the supply provides.
-    It will not produce freezing water; on the system captured, the cold supply bottomed out
-    near 60 °F while the setpoint read 32 °F.
+    **The range is the app's** (owner's decision, 2026-10-07, from Konnect 3.0.6
+    ``qa0/p.java`` / ``db0/c.java`` ``n0()``):
+
+    * the top is the valve's **current** ``maximumOutletTemperature`` — the scald limit the
+      Max Temperature setting writes, read live, so raising it in the app widens this;
+    * the floor is the outlet's ``minimumOutletTemperature`` — 59 °F / 15 °C on every
+      captured outlet;
+    * **one step below the floor is Cold.** Choosing it sends 0 °C, "full cold": the valve
+      stops mixing hot and delivers whatever the supply provides. It will not produce
+      freezing water; on the system captured, the cold supply bottomed out near 60 °F while
+      the setpoint read 32 °F. The app labels the same stop ``COLD``.
+
+    Until 2026-10-07 this was a fixed 92-118 °F, justified as matching the app's slider —
+    but that is the Max Temperature *setting's* range, not this control's.
+
+    Both ends come from the zone's first outlet, matching the app, which bounds the slider
+    with ``outletConfigurations[0]`` of each valve; until the valve has announced one, the
+    floor is 59 °F and the top 118 °F, the highest the app lets Max Temperature go.
     """
 
     _attr_device_class = NumberDeviceClass.TEMPERATURE
@@ -118,68 +133,84 @@ class ZoneTemperatureNumber(ZoneNumberBase):
         self._attr_name = zone_label(valve, zone, "Temperature")
         self._attr_unique_id = f"{self._device_id}_temperature_zone_{zone}"
         unit = coordinator.temperature_unit
-        fahrenheit = unit.lower().startswith("f")
+        self._fahrenheit = unit.lower().startswith("f")
         self._attr_native_unit_of_measurement = (
-            UnitOfTemperature.FAHRENHEIT if fahrenheit else UnitOfTemperature.CELSIUS
+            UnitOfTemperature.FAHRENHEIT
+            if self._fahrenheit
+            else UnitOfTemperature.CELSIUS
         )
-        # Bounds are a **Home Assistant-side gate**, not the device's range — see
-        # `UI_TEMPERATURE_MIN_F` / `UI_TEMPERATURE_MAX_F`. The valve still accepts 0 °C
-        # ("full cold") through 48.8 °C, the codec still encodes all of it, and the
-        # touchscreen or a preset can still take it outside these numbers. Narrowing this
-        # only decides what the slider offers.
-        if fahrenheit:
-            low = float(UI_TEMPERATURE_MIN_F)
-            high = float(UI_TEMPERATURE_MAX_F)
-        else:
-            # Rounded, not floored/ceiled: these are presentation bounds, and 26.7/45.0
-            # showing as 27/45 is friendlier than 27/45 with a hidden fraction.
-            low = float(round(unit_to_celsius(UI_TEMPERATURE_MIN_F, "Fahrenheit")))
-            high = float(round(unit_to_celsius(UI_TEMPERATURE_MAX_F, "Fahrenheit")))
-        self._attr_native_min_value = low
-        self._attr_native_max_value = high
+
+    def _display(self, celsius: float) -> float:
+        """A Celsius value in the account's unit, as a whole number."""
+        return float(round(celsius_to_unit(celsius, self.coordinator.temperature_unit)))
+
+    def _zone_limits(self):
+        state = self._valve.gcs_state
+        return state.outlet_limits.get(self._valve.model.outlet_id(self._zone, 1))
+
+    @property
+    def _floor(self) -> float:
+        """The lowest real setpoint — the outlet's minimum, else 59 °F / 15 °C."""
+        limits = self._zone_limits()
+        tenths = None if limits is None else limits.minimum_temperature_tenths
+        if tenths:
+            return self._display(tenths / 10)
+        if self._fahrenheit:
+            return float(ZONE_TEMPERATURE_MIN_F)
+        return float(round(unit_to_celsius(ZONE_TEMPERATURE_MIN_F, "Fahrenheit")))
+
+    @property
+    def native_min_value(self) -> float:
+        """The Cold stop: one step below the floor, as the app's ``coldTemperature`` is."""
+        return self._floor - 1
+
+    @property
+    def native_max_value(self) -> float:
+        """The valve's current scald limit, else the top of the app's Max Temperature range."""
+        limits = self._zone_limits()
+        tenths = None if limits is None else limits.maximum_temperature_tenths
+        if tenths:
+            return max(self._display(tenths / 10), self._floor)
+        if self._fahrenheit:
+            return float(UI_TEMPERATURE_MAX_F)
+        return float(round(unit_to_celsius(UI_TEMPERATURE_MAX_F, "Fahrenheit")))
 
     @property
     def native_value(self) -> float | None:
-        """The valve's setpoint, **clamped into this entity's declared range.**
+        """The valve's setpoint — the Cold stop for anything below the floor.
 
-        The bounds are a Home Assistant-side gate, not the device's: the valve accepts
-        0 °C ("full cold") through 48.8 °C, and the touchscreen or a preset can put it
-        there. Reporting a value outside `native_min_value`/`native_max_value` leaves the
-        slider with no position it can render and, in Celsius, a 0 °C setpoint reads as a
-        plain `0` against a 27-45 range — which looks like a broken entity rather than a
-        deliberate setting.
-
-        Clamped rather than widened because the narrow range is the point: it keeps the
-        slider usable for the temperatures people actually shower at. The unclamped reading
-        is published as `reported_temperature` so nothing is hidden, and a value that is
-        being clamped says so in `out_of_range`.
+        A setpoint under the floor is full cold in all but name (0 °C is what the app's Cold
+        stop writes), and reporting it raw would leave the slider with no position to
+        render. Above the top it is clamped for the same reason. The unclamped reading is
+        published as `reported_temperature`, and `cold` says when the stop is engaged.
         """
         word = self._word
         if word is None:
             return None
-        value = round(
-            celsius_to_unit(word.temperature_celsius, self.coordinator.temperature_unit)
-        )
-        return min(max(value, self._attr_native_min_value), self._attr_native_max_value)
+        value = self._display(word.temperature_celsius)
+        if value < self._floor:
+            return self.native_min_value
+        return min(value, self.native_max_value)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """The valve's real setpoint, and whether this entity is clamping it."""
+        """The valve's real setpoint, whether Cold is engaged, and whether it is clamped."""
         word = self._word
         if word is None:
             return {}
-        reported = round(
-            celsius_to_unit(word.temperature_celsius, self.coordinator.temperature_unit)
-        )
+        reported = self._display(word.temperature_celsius)
         return {
             "reported_temperature": reported,
-            "out_of_range": not (
-                self._attr_native_min_value <= reported <= self._attr_native_max_value
-            ),
+            "cold": reported < self._floor,
+            "out_of_range": reported > self.native_max_value,
         }
 
     async def async_set_native_value(self, value: float) -> None:
         key = "zone1_temperature" if self._zone == 1 else "zone2_temperature"
+        if value < self._floor:
+            # The Cold stop. 0 °C in the account's unit — 32 °F, which `unit_to_celsius`
+            # maps to 0 by arithmetic, as it is outside the app's 59-122 °F table.
+            value = 32.0 if self._fahrenheit else 0.0
         await self._valve.async_apply_valve(**{key: value})
 
 

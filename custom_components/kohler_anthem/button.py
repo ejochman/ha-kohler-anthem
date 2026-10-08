@@ -1,6 +1,6 @@
 """Buttons for the Kohler Anthem integration.
 
-One so far: start a new raw MQTT capture file. That exists because the natural way to get a
+Two: restart a valve (below), and start a new raw MQTT capture file. That exists because the natural way to get a
 fresh capture — restart Home Assistant — costs a full reload, drops the MQTT connection, and
 **clears the run-time cutoff tracking** (`ZoneCutoffDetector.forget()` on reconnect). None
 of which anyone wants in the middle of a sequence of shower experiments.
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 
-from homeassistant.components.button import ButtonEntity
+from homeassistant.components.button import ButtonDeviceClass, ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
@@ -33,6 +33,9 @@ async def async_setup_entry(
 ) -> None:
     """Set up the capture button on whichever device this account has."""
     coordinator: KohlerAnthemCoordinator = hass.data[DOMAIN][entry.entry_id]
+    async_add_entities(
+        [ValveRestartButton(coordinator, valve) for valve in coordinator.valves]
+    )
 
     # The capture covers the whole account rather than one device, so it only needs to live
     # somewhere findable. The first valve the cloud lists is the primary device where one
@@ -45,6 +48,35 @@ async def async_setup_entry(
         async_add_entities(
             [ControllerNewCaptureButton(coordinator, coordinator.controllers[0])]
         )
+
+
+class ValveRestartButton(KohlerValveEntity, ButtonEntity):
+    """Reboot the valve — the Konnect app's Settings → Restart Product.
+
+    ``valvereset {reset: "productRestart"}``, the body Konnect 3.0.6 sends. The app asks
+    "Are you sure you want to restart this product?" first and shows "Rebooting Product";
+    a Home Assistant button cannot ask, which is why this one is **disabled by default** —
+    enable it on purpose, from the device page.
+
+    🚿 **A restart stops any running water.** It is recorded as this integration's own
+    write, so Endless Shower never mistakes the reboot for a run-time cutoff and restarts
+    the shower into it. It **cannot** bring back a valve that has dropped off the cloud:
+    that valve never receives the command — power-cycle it at the breaker instead.
+
+    Added 2026-10-07; app-confirmed, not yet pressed against hardware by this integration.
+    """
+
+    _attr_name = "Restart"
+    _attr_device_class = ButtonDeviceClass.RESTART
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(self, coordinator: KohlerAnthemCoordinator, valve: Valve) -> None:
+        super().__init__(coordinator, valve)
+        self._attr_unique_id = f"{self._device_id}_restart"
+
+    async def async_press(self) -> None:
+        await self._valve.async_restart()
 
 
 class _NewCaptureMixin:

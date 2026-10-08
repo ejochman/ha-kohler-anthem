@@ -281,6 +281,75 @@ def _configuration_report(valve: Valve) -> dict[str, Any]:
     }
 
 
+#: Fields of a firmware read worth reporting. `url` (the image's download address) and
+#: anything else is left out — a report needs the versions and the verdict, not the file.
+_FIRMWARE_FIELDS = (
+    "currentFirmware",
+    "firmware",
+    "firmwareUpdateAvailable",
+    "mandatoryUpdate",
+    "otaStatus",
+    "skip",
+)
+
+
+def _firmware_report(info: Mapping[str, Any] | None) -> dict[str, Any]:
+    info = info or {}
+    return {key: info.get(key) for key in _FIRMWARE_FIELDS if key in info}
+
+
+def _about_report(about: Mapping[str, Any] | None) -> dict[str, Any]:
+    """`gcs-configuration/{id}/about`, with every serial reduced to "present or not".
+
+    Serials double as cloud addresses (see the module docstring), so they never appear;
+    models, firmware and status do, because they are what a hardware report is read for.
+    """
+    about = about or {}
+
+    def part(entry: Any) -> dict[str, Any]:
+        if not isinstance(entry, Mapping):
+            return {}
+        return {
+            **{
+                k: entry.get(k)
+                for k in ("model", "name", "firmware", "status")
+                if k in entry
+            },
+            "serial_present": bool(entry.get("serialNo")),
+        }
+
+    valves = about.get("valvesConfigInfo")
+    interfaces = about.get("interfacesConfigInfo")
+    return {
+        "gateway": part(about.get("gatewayConfigInfo")),
+        "valves": [part(v) for v in valves] if isinstance(valves, list) else [],
+        "interfaces": (
+            [part(i) for i in interfaces] if isinstance(interfaces, list) else []
+        ),
+    }
+
+
+def _fault_log(payload: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """`gcs-diagnostics` entries, ids stripped, the app's own `errorCode "0"` filter applied."""
+    details = (payload or {}).get("errorDetails")
+    keep = (
+        "errorCode",
+        "title",
+        "description",
+        "errorState",
+        "isActive",
+        "timestamp",
+        "valveId",
+        "component",
+        "area",
+    )
+    return [
+        {k: entry.get(k) for k in keep if k in entry}
+        for entry in (details if isinstance(details, list) else [])
+        if isinstance(entry, Mapping) and str(entry.get("errorCode") or "0") != "0"
+    ]
+
+
 def _valve_report(valve: Valve) -> dict[str, Any]:
     """One valve's state, limits, and its own Endless Shower and warm-up settings."""
     gcs = valve.gcs_state
@@ -395,6 +464,15 @@ def _valve_report(valve: Valve) -> dict[str, Any]:
             "auto_restore": valve.warmup_auto_restore,
             "restores_to": valve.last_warmup_mode,
         },
+        # `currentSystemState` is reported above; `has_fault` folds in its `error` value,
+        # which no capture has carried, so the first one shows in a report.
+        "has_fault": gcs.has_fault,
+        "dispensed_volume": gcs.dispensed_volume,
+        "about": _about_report(valve.about_parts),
+        "firmware": {
+            part: _firmware_report(info)
+            for part, info in (valve.firmware_info or {}).items()
+        },
     }
 
 
@@ -403,6 +481,7 @@ def _controller_report(controller: Controller) -> dict[str, Any]:
     hub = controller.state
     caps = controller.capabilities
     model = controller.model
+    settings = controller.settings
     return {
         # The layout this controller actually decodes with — its own, which can differ
         # from the entry's `model` above when the account has several controllers.
@@ -433,6 +512,32 @@ def _controller_report(controller: Controller) -> dict[str, Any]:
             "steam": caps.steam,
         },
         "last_update": hub.last_update,
+        "steam_status": hub.steam_status,
+        "light_groups": dict(hub.lights),
+        "active_experience": hub.active_experience,
+        "error": hub.error,
+        "error_components": dict(hub.error_components),
+        "active_errors": [
+            {k: e.get(k) for k in ("errorCode", "title", "component", "isActive")}
+            for e in controller.active_errors
+        ],
+        # The controller's own settings. The LAN address is reduced to its presence: it
+        # identifies a home network, and a report needs only to know it was published.
+        "settings": {
+            "max_shower_duration_minutes": settings.max_shower_duration_minutes,
+            "shower_max_temperature": settings.shower_max_temperature,
+            "temperature_unit": settings.temperature_unit,
+            "flow_rate_enabled": settings.flow_rate_enabled,
+            "steam_default_temperature": settings.steam_default_temperature,
+            "steam_default_time": settings.steam_default_time,
+            "light_group_count": len(settings.light_groups),
+            "lan_ip_present": settings.lan_ip is not None,
+            "disconnected": list(settings.disconnected),
+        },
+        "experiences": {
+            category: len(items) for category, items in controller.experiences.items()
+        },
+        "firmware": _firmware_report(controller.firmware_info),
     }
 
 
@@ -524,11 +629,29 @@ def _coordinator(hass: HomeAssistant, entry: ConfigEntry) -> KohlerAnthemCoordin
     return hass.data[DOMAIN][entry.entry_id]
 
 
+async def _async_add_fault_logs(
+    coordinator: KohlerAnthemCoordinator, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Attach each valve's `gcs-diagnostics` fault log, read now.
+
+    Read on demand rather than kept: it is only ever wanted at the moment someone is
+    building a report, and the client answers `{}` on failure, so an unreachable endpoint
+    costs an empty list rather than the report.
+    """
+    for index, valve in enumerate(coordinator.valves):
+        log = _fault_log(await valve.client.async_get_gcs_diagnostics(valve.device_id))
+        payload["valves"][index]["fault_log"] = log
+        if index == 0 or payload.get("requested_for") == f"valve_{index}":
+            payload.setdefault("valve", {})["fault_log"] = log
+    return payload
+
+
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: ConfigEntry
 ) -> dict[str, Any]:
     """Diagnostics from the integration card."""
-    return _build(_coordinator(hass, entry), "config_entry")
+    coordinator = _coordinator(hass, entry)
+    return await _async_add_fault_logs(coordinator, _build(coordinator, "config_entry"))
 
 
 async def async_get_device_diagnostics(
@@ -565,4 +688,6 @@ async def async_get_device_diagnostics(
                     else f"controller_{index}"
                 )
                 controller_index = index
-    return _build(coordinator, requested_for, valve_index, controller_index)
+    return await _async_add_fault_logs(
+        coordinator, _build(coordinator, requested_for, valve_index, controller_index)
+    )

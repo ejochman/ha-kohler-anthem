@@ -7,7 +7,8 @@ Kohler reports failure in two places and you have to check both:
 
 * the HTTP status, and
 * a ``statusCode`` field **inside** a 200/400 body — ``900`` means the device is offline,
-  ``902`` means it is running and refuses the edit.
+  ``901``/``902`` that it is running and refuses the edit; the rest of the table is in
+  ``const.STATUS_MESSAGES``.
 
 A request can therefore "succeed" with HTTP 200 and still have done nothing.
 """
@@ -27,20 +28,28 @@ from .const import (
     API_BASE,
     APIM_SUBSCRIPTION_KEY,
     CUSTOMER_DEVICE,
+    GCS_ABOUT,
     GCS_ADVANCE_STATE,
     GCS_CONFIGURATION,
+    GCS_DIAGNOSTICS,
+    GCS_FIRMWARE,
+    GCS_GATEWAY_FIRMWARE,
     GCS_PRESETS,
     GCS_STATE,
     GCS_USAGE,
     HUB_CONFIGURATION,
+    HUB_DIAGNOSTICS_ACTIVE,
     HUB_EXPERIENCES,
     HUB_FAVORITES,
+    HUB_FIRMWARE,
     HUB_STATE,
     MOBILE_SETTINGS,
     SKU_GCS,
     SKU_HUB,
     STATUS_DEVICE_OFFLINE,
     STATUS_DEVICE_RUNNING,
+    STATUS_DEVICE_RUNNING_ALT,
+    STATUS_MESSAGES,
 )
 from .models import OutletStateSource, resolve_outlet_source
 
@@ -52,6 +61,11 @@ _LOGGER = logging.getLogger(__name__)
 _ID_IN_PATH = re.compile(
     r"/((?:gcs|hub|customer)-[a-z-]*/(?:[a-z]+/)?)[^/?]+",
     re.IGNORECASE,
+)
+#: The firmware family puts the id after a bare product name instead —
+#: `/platform/api/v1/firmware/gcs/gateway/<id>?releasetarget=Public`.
+_ID_IN_FIRMWARE_PATH = re.compile(
+    r"(/firmware/(?:gcs|hub)/(?:gateway/)?)[^/?]+", re.IGNORECASE
 )
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
@@ -79,7 +93,7 @@ class DeviceOffline(KohlerError):
 
 
 class DeviceRunning(KohlerError):
-    """The device is running and refuses the change (statusCode 902).
+    """The device is running and refuses the change (statusCode 902, or 901).
 
     Editing a HUB favorite requires the system to be stopped first. Activating one is
     allowed at any time, which is why the practical pattern is to pre-create a favorite
@@ -112,8 +126,9 @@ class Customer:
         self.raw = raw
         # "Fahrenheit" or "Celsius". Kohler's REST API and the GCS valve byte both report
         # Celsius regardless; this is the account's *display* preference, which the mobile
-        # app converts to locally. The HUB's favorite temperatures, however, ARE in this
-        # unit — so it decides how HUB writes are encoded.
+        # app converts to locally. The HUB's favorite temperatures are the opposite case —
+        # whole °F on the wire whatever this says (Konnect 3.0.6) — so this decides only
+        # how a value typed in the account's unit is converted, never the wire unit.
         self.temperature_unit: str = raw.get("temperatureUnit") or "Fahrenheit"
         self.water_units: str = raw.get("waterUnits") or "Standard"
         self.devices: list[Device] = [
@@ -320,33 +335,48 @@ class KohlerClient:
         """An endpoint path with its device or tenant id replaced by `<id>`.
 
         **Every read endpoint carries an id in its path**, so an error message built from one
-        carries a cloud address — and those messages reach WARNING and ERROR logs, the
-        `probe_usage` report file, and service responses. `diagnostics.py` goes to length to
+        carries a cloud address — and those messages reach WARNING and ERROR logs and
+        service responses. `diagnostics.py` goes to length to
         redact exactly this; an exception string handed it back.
 
         The shape is what makes an error useful (`gcs-usage/<id> failed with HTTP 400` says
         which endpoint and why), and the shape is all this keeps. Write endpoints have no id
         in the path — the id travels in the body — so they are unaffected either way.
         """
-        return _ID_IN_PATH.sub(r"/\1<id>", path)
+        return _ID_IN_FIRMWARE_PATH.sub(r"\1<id>", _ID_IN_PATH.sub(r"/\1<id>", path))
 
     @staticmethod
     def _raise_for_payload(status: int, path: str, payload: Any) -> None:
-        """Translate Kohler's HTTP status and in-body statusCode into exceptions."""
-        inner = payload.get("statusCode") if isinstance(payload, dict) else None
+        """Translate Kohler's HTTP status and in-body statusCode into exceptions.
+
+        ``statusCode`` is compared **as a string**. Konnect models it as one, and an int
+        comparison — what this did until 2026-10-07 — silently misses a ``"900"``.
+        """
+        raw = payload.get("statusCode") if isinstance(payload, dict) else None
+        inner = None if raw is None else str(raw).strip()
         if inner == STATUS_DEVICE_OFFLINE:
             raise DeviceOffline(
                 "The Kohler device is offline. Check that it is powered on and "
                 "connected to Wi-Fi.",
                 payload,
             )
-        if inner == STATUS_DEVICE_RUNNING:
+        if inner in (STATUS_DEVICE_RUNNING, STATUS_DEVICE_RUNNING_ALT):
             raise DeviceRunning(
                 "The system is running, so this change was rejected. Stop it first "
                 "(stopall), then retry.",
                 payload,
             )
         if status >= 400:
+            # A code from the app's own table says *why* in words; Kohler's body `message`
+            # is usually just "Something went wrong".
+            meaning = STATUS_MESSAGES.get(inner or "")
+            if meaning is not None:
+                raise KohlerError(
+                    f"{KohlerClient.safe_path(path)} was refused: {meaning} "
+                    f"(statusCode {inner})",
+                    payload,
+                    status,
+                )
             detail = payload if isinstance(payload, str) else repr(payload)
             raise KohlerError(
                 f"{KohlerClient.safe_path(path)} failed with HTTP {status}: {detail}",
@@ -438,10 +468,12 @@ class KohlerClient:
         customer's `waterUnits` is `Standard` and shows it raw otherwise. `LITRES_PER_...`
         callers should use `usage_volume_gallons` rather than repeat the constant.
 
-        `interval` is `WEEK`, `MONTH` or `YEAR`, uppercase. The query parameters are
-        PascalCase — `FromDate`, `ToDate`, `Interval` — which is the whole reason this
-        endpoint went unsolved: every other endpoint in this API is camelCase, and a wrong
-        case is rejected with the same generic 400 as a bare call.
+        `interval` is `DAY` or `MONTH`. The query parameters are PascalCase — `FromDate`,
+        `ToDate`, `Interval` — which is the whole reason this endpoint went unsolved: every
+        other endpoint in this API is camelCase, and a wrong case is rejected with the same
+        generic 400 as a bare call. Konnect 3.0.6 sends exactly two intervals, `Day` and
+        `Month`, with `MM-dd-yyyy` dates; `WEEK` and `YEAR` are not intervals the server
+        knows. See `GCS_USAGE` in `const.py`.
 
         Returns `{}` rather than raising when the read fails: this feeds a diagnostic sensor,
         and a setup that already works must not start failing over it.
@@ -456,51 +488,6 @@ class KohlerClient:
             _LOGGER.debug("Could not read gcs-usage: %s", err)
             return {}
         return payload if isinstance(payload, dict) else {}
-
-    async def async_probe_usage(
-        self, device_id: str, attempts: list[tuple[str, str]]
-    ) -> list[dict[str, Any]]:
-        """Call `gcs-usage` with candidate query strings and report what each returns.
-
-        **Exploratory, and deliberately not wired into anything.** The endpoint answers HTTP
-        400 to a bare call while its neighbours answer 404, so the route is real and wants
-        parameters nobody has recorded. This tries a list of candidates and reports the
-        status and shape of each, which is the only way to learn the contract without the
-        Konnect APK to decompile.
-
-        Each attempt is ``(label, query)`` where `query` is appended after `?`. Failures are
-        captured rather than raised: a 400 is the expected answer for most candidates and is
-        itself the finding. Returns one record per attempt, with the payload included only
-        when the call succeeded — an error body can echo back parameters, and this result is
-        written to a file the owner may attach to an issue.
-        """
-        results: list[dict[str, Any]] = []
-        for label, query in attempts:
-            path = GCS_USAGE.format(device_id=device_id)
-            if query:
-                path = f"{path}?{query}"
-            record: dict[str, Any] = {"label": label, "query": query}
-            try:
-                payload = await self.async_request("GET", path)
-            except KohlerError as err:
-                # The status is in the message; the message itself may quote an error body,
-                # so it is truncated rather than stored whole. `safe_path` has already taken
-                # the id out of the path, and this belt-and-braces pass catches an id echoed
-                # back inside a body — truncation alone would not, since the id can sit
-                # anywhere in it.
-                record["error"] = str(err).replace(device_id, "<id>")[:300]
-            else:
-                record["ok"] = True
-                record["payload_type"] = type(payload).__name__
-                if isinstance(payload, dict):
-                    record["keys"] = sorted(payload)
-                elif isinstance(payload, list):
-                    record["length"] = len(payload)
-                    if payload and isinstance(payload[0], dict):
-                        record["item_keys"] = sorted(payload[0])
-                record["payload"] = payload
-            results.append(record)
-        return results
 
     async def async_get_gcs_configuration(self, device_id: str) -> dict[str, Any]:
         """Read the valve's configuration record — firmware, and possibly nothing else.
@@ -550,10 +537,79 @@ class KohlerClient:
         )
 
     async def async_get_hub_configuration(self, device_id: str) -> dict[str, Any]:
-        """Zones, outlets, installed parts, and capability flags."""
+        """Zones, outlets, installed parts, capability flags — and the controller's settings.
+
+        ``configuration.systemSettings`` carries ``maxShowerDuration`` (minutes),
+        ``showerMaxTemperature``, ``temperatureUnit`` and ``flowRateEnable``;
+        ``steamSettings`` the steam defaults; ``lightSettings[]`` the light groups; and
+        ``about.hub.wlan.ip`` the controller's LAN address. See ``HubSettings``.
+        """
         return await self.async_request(
             "GET", HUB_CONFIGURATION.format(device_id=device_id)
         )
+
+    async def async_get_hub_active_errors(self, device_id: str) -> dict[str, Any]:
+        """The controller's currently active faults, as ``errorDetails[]``.
+
+        What the app shows as "`<title>` error `<errorCode>` detected". Returns ``{}``
+        rather than raising: this feeds a problem sensor's attributes and must not fail a
+        setup that otherwise works.
+        """
+        try:
+            payload = await self.async_request(
+                "GET", HUB_DIAGNOSTICS_ACTIVE.format(device_id=device_id)
+            )
+        except KohlerError as err:
+            _LOGGER.debug("Could not read hub-diagnostics/active: %s", err)
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    async def async_get_gcs_about(self, device_id: str) -> dict[str, Any]:
+        """Per-part identity — gateway, valves and interfaces, with serials and models.
+
+        Returns ``{}`` rather than raising: device-registry detail, never worth failing
+        setup over.
+        """
+        try:
+            payload = await self.async_request(
+                "GET", GCS_ABOUT.format(device_id=device_id)
+            )
+        except KohlerError as err:
+            _LOGGER.debug("Could not read gcs-configuration/about: %s", err)
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    async def async_get_gcs_diagnostics(self, device_id: str) -> dict[str, Any]:
+        """The valve's fault log. ``{}`` on failure; read for diagnostics only."""
+        try:
+            payload = await self.async_request(
+                "GET", GCS_DIAGNOSTICS.format(device_id=device_id)
+            )
+        except KohlerError as err:
+            _LOGGER.debug("Could not read gcs-diagnostics: %s", err)
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    async def async_get_firmware(self, device_id: str, part: str) -> dict[str, Any]:
+        """Installed vs latest firmware for one part: ``gcs``, ``gateway`` or ``hub``.
+
+        Read-only. ``firmwareUpdateAvailable`` is the app's whole test for "update
+        available". Returns ``{}`` rather than raising: an update entity going unknown is
+        the right failure, not a broken setup.
+        """
+        template = {
+            "gcs": GCS_FIRMWARE,
+            "gateway": GCS_GATEWAY_FIRMWARE,
+            "hub": HUB_FIRMWARE,
+        }[part]
+        try:
+            payload = await self.async_request(
+                "GET", template.format(device_id=device_id)
+            )
+        except KohlerError as err:
+            _LOGGER.debug("Could not read %s firmware: %s", part, err)
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
 
 # Keys whose VALUES are credentials or identity, redacted before anything is logged. The
@@ -571,8 +627,8 @@ _SECRET_KEY_PARTS = (
 
 
 # Credential-bearing VALUES whose key name gives nothing away. `_SECRET_KEY_PARTS` catches
-# the field names Kohler is known to use, but this runs on whatever the cloud returns —
-# including `probe_usage`, which deliberately calls undocumented endpoints. An Azure
+# the field names Kohler is known to use, but this runs on whatever the cloud returns,
+# including endpoints whose full shape no capture has covered. An Azure
 # connection string is the realistic case: the whole secret sits inside one string under a
 # neutral key like `connectionString`, so a key-only check copies it out in full.
 _SECRET_IN_VALUE = re.compile(

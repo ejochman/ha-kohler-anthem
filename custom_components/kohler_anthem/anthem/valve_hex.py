@@ -94,7 +94,8 @@ TEMPERATURE_BASE_C = 25.6
 TEMPERATURE_STEP_C = 0.1
 
 # ---------------------------------------------------------------------------
-# ⚠️ Fahrenheit is a LOOKUP TABLE, not arithmetic — Konnect 3.0.1, `p315jj/h.java:1971`
+# ⚠️ Fahrenheit is a LOOKUP TABLE, not arithmetic — Konnect 3.0.1 `p315jj/h.java:1971`,
+#    unchanged in 3.0.6 (`db0/c.java` `A()`, duplicated in `mc0/n.java`)
 # ---------------------------------------------------------------------------
 # `h.z()` maps a displayed whole °F to tenths of a °C directly, and it is **not**
 # `round((f - 32) * 50 / 9)`. Above 86 °F it sits exactly one tenth *below* that formula at
@@ -112,8 +113,17 @@ TEMPERATURE_STEP_C = 0.1
 #
 # Measured consequence, 2026-08-17: the owner reported the temperature coming back "one more"
 # after the shower restarted itself, and 0x185 (389) appears 11 times in this system's capture
-# corpus — a value **no Kohler client can emit**. `z()` cannot produce it, and the Celsius path
-# writes whole degrees (380/390/400). Those messages were this integration's own writes.
+# corpus. `z()` cannot produce it, and the Celsius path writes whole degrees (380/390/400), so
+# **no Kohler client emits it in a direct write** — which is what makes this table right for
+# `solowritesystem`.
+#
+# ⚠️ **Correction, 2026-10-07 (Konnect 3.0.6): the app does emit 389 — in favorites.** Its
+# favorite path converts a °F default temperature arithmetically, `(F - 32) * 0.5555`
+# formatted to one decimal (`db0/c.java` `J()`), so a favorite saved at 102 °F stores 38.9 °C
+# = 0x185, and a running favorite's temperature is what the valve word then reports. Those
+# 11 captured words could therefore be favorites as much as this integration's writes; the
+# earlier note calling 389 "a value no Kohler client can emit" was wrong. The conclusion for
+# direct writes stands. See `PRESET_ECHO_MAX_TENTHS` for the one place this changes code.
 #
 # The valve accepts off-ladder values perfectly well — nothing here is a protocol requirement.
 # What it costs is that a setpoint written from Home Assistant no longer sits where the
@@ -278,7 +288,12 @@ def flow_percent_to_byte(percent: float, max_flow_byte: int = FLOW_BYTE_MAX) -> 
 # Bit 0x80 differs by direction, like byte 0: on READ it is `errorFlag`, paired with the
 # error code in byte 7; on WRITE it is `skipWarmUp` (start without triggering warmup).
 # Corroborated by gcs-state, which reports errorFlag "0" / errorCode "1" while captures show
-# byte3 & 0x80 clear and byte7 = 0x01. Never observed set, so the write meaning is untested.
+# byte3 & 0x80 clear and byte7 = 0x01. Never observed set on hardware.
+#
+# Konnect 3.0.6 sets it in exactly one place: **bath fill** (`qb0/m0.java`). Starting a fill
+# writes bit 7 plus the tub filler's outlet bit (fixture type 21) on top of whatever is open,
+# at the current temperature and flow, and stopping one writes `0xC0`. Every other app write
+# leaves it clear. So the write meaning is app-confirmed; what the valve does with it is not.
 #
 # The outlet mask is ONLY the low three bits. 0x40 is an INDEPENDENT pause bit that
 # round-trips the device's pauseFlag (write: `Pi/r.java` getPauseFlag(); read: decodes into
@@ -364,6 +379,19 @@ def preset_word_temperature(word: str) -> float:
     return round(tenths / TEMPERATURE_TENTHS_PER_DEGREE, 1)
 
 
+#: The ceiling for a preset word **read back** and echoed into a write: 48.9 °C.
+#:
+#: One tenth above `TEMPERATURE_MAX_TENTHS`, because that is the highest value the Konnect
+#: app itself stores in a favorite: its favorite path converts °F arithmetically (see the
+#: correction above the Fahrenheit table), and 120 °F — the top of the older app's
+#: Max Temperature range — becomes `48.884` -> `"48.9"` -> 489. With the old ceiling a timer
+#: sync dropped that valve's word from a favorite the owner made in the app, silently
+#: changing the favorite. The valve still clamps any outlet at its own
+#: `maximumOutletTemperature`, which the app never writes above 48.8 °C, so admitting the
+#: app's own value admits nothing hotter than the valve would run.
+PRESET_ECHO_MAX_TENTHS = 489
+
+
 def check_preset_word(word: str) -> str:
     """Return ``word`` normalised, or raise if it is malformed or commands a scald.
 
@@ -375,11 +403,12 @@ def check_preset_word(word: str) -> str:
     command word does, so a corrupted or hostile record could set a preset to 102.3 °C and
     this integration would be the thing that wrote it there.
 
-    Applies exactly the ceiling :func:`encode_preset_word` clamps to, so a word this
-    integration wrote always passes and only a foreign one can fail.
+    The ceiling is :data:`PRESET_ECHO_MAX_TENTHS` — one tenth above what
+    :func:`encode_preset_word` clamps to, so a word this integration wrote always passes,
+    and so does anything the Konnect app can store; only a foreign value can fail.
     """
     text = str(word or "").strip().lower()
-    ceiling = TEMPERATURE_MAX_TENTHS / TEMPERATURE_TENTHS_PER_DEGREE
+    ceiling = PRESET_ECHO_MAX_TENTHS / TEMPERATURE_TENTHS_PER_DEGREE
     commanded = preset_word_temperature(text)
     if commanded > ceiling:
         raise ValveHexError(
@@ -666,6 +695,15 @@ def stop_pair(
     Mask ``0x00`` is STOP. The temperature and flow bytes are ignored by the firmware for a
     stop but still have to be well-formed — which is why the library's ``turn_off()``,
     sending an all-zero ``primaryValve1``, is ignored: prefix ``0x00`` addresses no valve.
+
+    ⚠️ **Deliberately not what the Konnect app sends.** The app's Stop writes byte 3 =
+    ``0x40`` — the pause bit with no outlets, exactly :func:`pause_pair` with no mask
+    (Konnect 3.0.6 ``db0/c.java``: the solo-write builder sets the per-valve pause bit when
+    stopping and zeroes the outlets; the older screens send the same). This integration keeps
+    ``0x00`` on purpose: ``runtime_cutoff`` restarts a shower on a ``0x40`` pause that lands
+    at the valve's own run-time limit, and a ``0x00`` stop is the one shape it never undoes.
+    Sending the app's word would make a Home Assistant stop that happened to coincide with
+    the limit indistinguishable from a cutoff. Both words leave the valve idle.
     """
     return _mask_pair(model, VALVE_STOP_MASK, temperature_celsius, flow_percent)
 

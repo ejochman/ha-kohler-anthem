@@ -155,6 +155,9 @@ async def async_setup_entry(
         # LIGHT_STS on this system despite `parts` reporting both NotConnected — 10 and 12
         # messages respectively — so subscribing would create entities for hardware nobody
         # owns, permanently reading OFF.
+        # Every controller: a fault, or a fitted accessory that has dropped off, is worth
+        # seeing whatever else is attached.
+        entities.append(ControllerProblemSensor(coordinator, controller))
         if attached(capabilities.music):
             entities.append(ControllerMusicSensor(coordinator, controller))
         if attached(capabilities.light):
@@ -254,6 +257,10 @@ class ValveProblemSensor(KohlerValveEntity, BinarySensorEntity):
             # indicator on its own — published so a real fault can be characterised from a
             # bug report rather than guessed at.
             "error_codes": codes,
+            # The second fault signal since 2026-10-07: the valve's own
+            # `currentSystemState`, which Konnect 3.0.6 treats as a fault when it reads
+            # `error`. Published so it is clear which signal fired.
+            "system_state": None if state is None else state.system_state,
             # Honest about the caveat in the class docstring: this detector has never been
             # seen to fire, so a False here is weaker evidence than it looks.
             "fault_detection_verified": False,
@@ -596,6 +603,63 @@ class ControllerAccessorySensor(KohlerControllerEntity, BinarySensorEntity):
         return None if state is None else getattr(state, f"{self._key}_on")
 
 
+class ControllerProblemSensor(KohlerControllerEntity, BinarySensorEntity):
+    """Whether the controller reports a fault, or a fitted accessory has dropped off.
+
+    Three sources, each one the Konnect app itself shows (Konnect 3.0.6, 2026-10-07):
+
+    * **Fault flags** — ``hub-state`` ``errorState`` / ``errorComponent`` and the
+      ``errorstate`` every accessory message carries (`HubState.has_fault`).
+    * **Active errors** — ``hub-diagnostics/{id}/active``, what the app words as
+      "`<title>` error `<errorCode>` detected".
+    * **Disconnected accessories** — a valve body, steam generator, amplifier or light
+      group the configuration says is fitted, whose ``parts`` entry is not ``Connected``
+      (`HubSettings.disconnected`), plus an absent or empty SD card. The accessory entities
+      are gated on ``parts``, so without this a fitted accessory that drops off simply
+      vanishes rather than reading as a problem.
+
+    Active errors and the disconnected list are read on each seed (setup and reconnect),
+    the flags live. Never seen on the reference system, which has had no fault to show.
+    """
+
+    _attr_name = "Problem"
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+
+    def __init__(
+        self, coordinator: KohlerAnthemCoordinator, controller: Controller
+    ) -> None:
+        super().__init__(coordinator, controller)
+        self._attr_unique_id = f"{self._device_id}_problem"
+
+    @property
+    def is_on(self) -> bool | None:
+        state = self._state
+        flags = None if state is None else state.has_fault
+        if self._controller.active_errors or self._controller.settings.disconnected:
+            return True
+        return flags
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        state = self._state
+        return {
+            "error_components": (
+                sorted(k for k, v in state.error_components.items() if v)
+                if state is not None
+                else []
+            ),
+            "disconnected": list(self._controller.settings.disconnected),
+            "active_errors": [
+                {
+                    "code": entry.get("errorCode"),
+                    "title": entry.get("title"),
+                    "component": entry.get("component"),
+                }
+                for entry in self._controller.active_errors
+            ],
+        }
+
+
 class ControllerMusicSensor(ControllerAccessorySensor):
     """Whether the controller's amplifier is playing. From ``MUSIC_STS``.
 
@@ -629,6 +693,20 @@ class ControllerLightSensor(ControllerAccessorySensor):
     ) -> None:
         super().__init__(coordinator, controller, "light")
 
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        """Each light group's own state — on if **any** group is on.
+
+        `LIGHT_STS` reports one group per message (`component` `lightgroupA/B/C`). Until
+        2026-10-07 the last message alone decided this sensor, so a second group turning off
+        read as "lights off" while the first was still lit.
+        """
+        state = self._state
+        return {
+            "groups": {} if state is None else dict(state.lights),
+            "configured_groups": list(self._controller.settings.light_groups),
+        }
+
 
 class ControllerSteamSensor(ControllerAccessorySensor):
     """Whether the steam generator is running. From ``STEAM_STS``.
@@ -645,6 +723,25 @@ class ControllerSteamSensor(ControllerAccessorySensor):
         self, coordinator: KohlerAnthemCoordinator, controller: Controller
     ) -> None:
         super().__init__(coordinator, controller, "steam")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        """The detail `STEAM_STS` carries, which this sensor dropped until 2026-10-07.
+
+        `status` is the raw value — `ON`, `OFF`, or `POWERCLEAN` while the generator cleans
+        itself (the app: "Power clean is in progress. Please stay out of your shower.").
+        Temperature is as the controller sends it, °F on every surface the app reads.
+        """
+        state = self._state
+        if state is None:
+            return {}
+        return {
+            "status": state.steam_status,
+            "power_clean": state.steam_powerclean,
+            "temperature": state.steam_temperature,
+            "start_time": state.steam_start_time,
+            "total_time": state.steam_total_time,
+        }
 
 
 class ControllerOutletSensor(KohlerControllerEntity, BinarySensorEntity):

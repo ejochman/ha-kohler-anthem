@@ -43,6 +43,10 @@
     "outlet_write_unverified": {
       "title": "Puede que un ajuste de la ducha no se haya aplicado",
       "description": "Home Assistant pidió a tu válvula que cambiara **{setting}**, y la válvula aceptó la solicitud, pero al leer el valor de nuevo después no se mostró el cambio.\n\n{detail}\n\n**Qué significa esto.** La API de Kohler responde \"aceptado para su entrega\", nunca \"aplicado\", por lo que esta comprobación existe para detectar la diferencia. El ajuste podría seguir teniendo el valor anterior.\n\n**Qué hacer.** Abre la entidad y vuelve a establecerlo. Si falla una segunda vez, comprueba que la válvula esté en línea en la aplicación Kohler Konnect; una válvula que se ha desconectado de la nube acepta comandos que nunca le llegan.\n\nEste mensaje desaparece cuando un cambio se verifica."
+    },
+    "durations_differ": {
+      "title": "Tus dos duraciones máximas de ducha no coinciden",
+      "description": "Ducha Infinita está activada para **{valve}**, cuyo límite de tiempo de ducha es de **{valve_minutes} minutos**, pero **{controller}** detiene la ducha a los **{controller_minutes} minutos**.\n\n**Por qué importa.** Ducha Infinita reinicia la ducha cuando el límite de la válvula la pausa. Si el límite del controlador es distinto, el controlador puede terminar la ducha con su propio temporizador, y esa parada no se puede deshacer.\n\n**Qué hacer.** Pon ambos en el mismo valor: el de la válvula en la app Kohler Konnect (ajustes de ducha → duración máxima de la ducha) o con el control Max Shower Duration de esta integración, y el del controlador en su propia página de ajustes. Este mensaje desaparece cuando coinciden; el valor del controlador se vuelve a leer cuando Home Assistant se reconecta a Kohler."
     }
   }
 }

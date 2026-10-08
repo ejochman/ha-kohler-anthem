@@ -170,8 +170,10 @@ that can run water deserves that caution.
 `send_valve_hex` actions, each feature in detail, automation examples and troubleshooting.
 
 **[docs/](docs/)** also has the valve command word reference
-([`gcs/valve_hex.md`](docs/gcs/valve_hex.md)) and how to capture diagnostics
-([`mqtt/capture_runbook.md`](docs/mqtt/capture_runbook.md)).
+([`gcs/valve_hex.md`](docs/gcs/valve_hex.md)), how to capture diagnostics
+([`mqtt/capture_runbook.md`](docs/mqtt/capture_runbook.md)), and — for developers — a
+reference to Kohler Konnect's cloud protocol ([`protocol/`](docs/protocol/README.md)),
+written so other Kohler integrations can reuse it.
 
 ## Prior art
 

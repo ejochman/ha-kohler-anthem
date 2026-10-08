@@ -110,6 +110,17 @@ break the preset case, which is exactly what `also_paused` exists for. The owner
 this: a real installation sets the longest available duration (60 min), so the window is ten
 seconds in an hour, and 15 min was only ever used to make experiments run faster.
 
+**The Konnect app's Stop is in the same class** — established 2026-10-07 from Konnect 3.0.6,
+whose stop writes byte 3 = `0x40` with no outlets, not `0x00` (`valve_hex.stop_pair` has the
+evidence). So pressing Stop in the app within the tolerance of the limit restarts the water
+too, exactly as the first-gen screen does, and for the same reason it is accepted. This
+integration's own stop stays `0x00` precisely so that Home Assistant is *not* in this class.
+
+**The duration-matching rule is now checked, not assumed.** The controller's Max Shower
+Duration is readable from the cloud (`hub-configuration` `systemSettings.maxShowerDuration`,
+minutes — also from Konnect 3.0.6), so a mismatch raises a Repairs card rather than relying on
+the owner having read this; see `KohlerAnthemCoordinator.async_refresh_duration_issues`.
+
 ### The 2026-08-17 reasoning, superseded but kept for the record
 
 **A `0x00` stop is now treated exactly like a `0x40` pause.** The rule above described the
@@ -242,8 +253,9 @@ CUTOFF_TOLERANCE_SECONDS = 2.0
 #
 # **The rule: a whole number of MINUTES, overshot by a fraction of a second.**
 #
-# `maxshowerduration` is stored in **minutes** (`docs/hub/local_api.md` §3a), so the
-# controller's ceiling always lands on a minute boundary whatever it is set to. And the
+# `maxshowerduration` is stored in **minutes** (`docs/hub/local_api.md` §3a, and the cloud's
+# `systemSettings.maxShowerDuration` agrees), so the controller's ceiling always lands on a
+# minute boundary whatever it is set to. And the
 # controller always fires **late, never early** — every measurement, across every setting:
 #
 #     900 s setting   +0.30 .. +1.25 s   thirteen cutoffs, case studies 2, 3, 7

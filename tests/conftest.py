@@ -148,6 +148,16 @@ class FakeState:
     def selectable_presets(self, hidden=()) -> list:
         return []
 
+    def experiences(self) -> list:
+        return []
+
+    def experience_by_name(self, name):
+        return None
+
+    @property
+    def firmware_updating(self) -> bool:
+        return self.system_state == "FirmwareUpdate"
+
 
 def make_valve(model, types, *, device_id="gcs-test0001", run_time=1800):
     """A `Valve` stand-in carrying only what entities touch."""
@@ -177,6 +187,8 @@ def make_valve(model, types, *, device_id="gcs-test0001", run_time=1800):
         warmup_auto_restore=False,
         last_warmup_mode=None,
         zone_flowing_for=lambda zone: None,
+        about_parts={},
+        firmware_info={},
     )
 
 
@@ -188,7 +200,7 @@ def make_controller(model, *, device_id="hub-test0001", name="Anthem Plus", zone
     entity reads through, which is the point of the exercise. Everything a `Controller`
     reaches out to (the cloud command surface) is stubbed.
     """
-    from custom_components.kohler_anthem.anthem.hub import HubCapabilities
+    from custom_components.kohler_anthem.anthem.hub import HubCapabilities, HubSettings
     from custom_components.kohler_anthem.anthem.state import HubState, HubZone
 
     state = HubState(model=model)
@@ -214,6 +226,10 @@ def make_controller(model, *, device_id="hub-test0001", name="Anthem Plus", zone
         favorites=[],
         water_is_running=False,
         report_log=SimpleNamespace(enabled=False, path=None),
+        settings=HubSettings(),
+        experiences={},
+        active_errors=[],
+        firmware_info={},
     )
 
 

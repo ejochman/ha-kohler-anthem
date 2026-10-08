@@ -43,6 +43,10 @@
     "outlet_write_unverified": {
       "title": "Een doucheinstelling is mogelijk niet toegepast",
       "description": "Home Assistant heeft je klep gevraagd om **{setting}** te wijzigen, en de klep heeft het verzoek geaccepteerd — maar bij het opnieuw uitlezen van de waarde bleek de wijziging niet te zijn doorgevoerd.\n\n{detail}\n\n**Wat dit betekent.** De API van Kohler antwoordt met \"geaccepteerd voor levering\", nooit met \"toegepast\", daarom bestaat deze controle om het verschil op te sporen. De instelling heeft mogelijk nog de oude waarde.\n\n**Wat te doen.** Open de entiteit en stel deze opnieuw in. Als het een tweede keer mislukt, controleer dan of de klep online is in de Kohler Konnect-app — een klep die de verbinding met de cloud heeft verloren, accepteert opdrachten die nooit aankomen.\n\nDit bericht verdwijnt zodra een wijziging is geverifieerd."
+    },
+    "durations_differ": {
+      "title": "Je twee maximale doucheduren verschillen",
+      "description": "Oneindige douche staat aan voor **{valve}**, waarvan de tijdslimiet **{valve_minutes} minuten** is, maar **{controller}** stopt een douche na **{controller_minutes} minuten**.\n\n**Waarom dit belangrijk is.** Oneindige douche start de douche opnieuw wanneer de limiet van de klep hem pauzeert. Als de limiet van de controller anders is, kan de controller de douche op zijn eigen timer beëindigen, en die stop kan niet ongedaan worden gemaakt.\n\n**Wat te doen.** Zet beide op dezelfde waarde: die van de klep in de Kohler Konnect-app (douche-instellingen → maximale doucheduur) of met de Max Shower Duration-instelling van deze integratie, en die van de controller op zijn eigen instellingenpagina. Deze melding verdwijnt zodra ze overeenkomen — de waarde van de controller wordt opnieuw gelezen wanneer Home Assistant opnieuw verbinding maakt met Kohler."
     }
   }
 }

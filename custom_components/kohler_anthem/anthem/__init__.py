@@ -11,10 +11,12 @@ Covers both products:
 * **Anthem Plus** (SKU ``HUB``) — the Linux system controller that drives the valves and
   integrates music, lighting, and steam. Control is organised around favorites.
 
-Written against the protocol documentation in ``docs/``, which is capture-derived. The
-``kohler-anthem`` library reads three of these behaviours differently; it was decompiled from
-the same APK but not checked against captures, so where the two disagree see
-``docs/gcs/valve_hex.md``.
+Written against live captures and two decompiles of the Konnect Android app (3.0.1, and
+3.0.6 on 2026-10-07). ``docs/protocol/`` is the developer reference — every endpoint, body,
+message and code, marked app-confirmed or live-verified — and is written to be reused by
+other Kohler Konnect integrations. The ``kohler-anthem`` library reads three of these
+behaviours differently; it was decompiled from the same APK but not checked against
+captures, so where the two disagree see ``docs/gcs/valve_hex.md``.
 """
 
 from __future__ import annotations
@@ -46,7 +48,13 @@ from .const import (
 )
 from .cutoff_log import WARMUP_README, CutoffDebugLog
 from .gcs import GcsDevice
-from .hub import HubCapabilities, HubDevice, zone_number, zone_outlet_flags
+from .hub import (
+    HubCapabilities,
+    HubDevice,
+    HubSettings,
+    zone_number,
+    zone_outlet_flags,
+)
 from .models import (
     DEFAULT_VALVE_MODEL,
     VALVE_MODELS,
@@ -111,6 +119,7 @@ __all__ = [
     "GcsState",
     "HubCapabilities",
     "HubDevice",
+    "HubSettings",
     "HubState",
     "HubZone",
     "InvalidCredentials",

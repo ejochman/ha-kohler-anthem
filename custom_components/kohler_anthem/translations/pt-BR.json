@@ -43,6 +43,10 @@
     "outlet_write_unverified": {
       "title": "Uma configuração do chuveiro pode não ter sido aplicada",
       "description": "O Home Assistant pediu à sua válvula para alterar **{setting}**, e a válvula aceitou o pedido — mas ao ler o valor novamente depois, a mudança não apareceu.\n\n{detail}\n\n**O que isso significa.** A API da Kohler responde \"aceito para entrega\", nunca \"aplicado\", por isso essa verificação existe para detectar a diferença. A configuração ainda pode estar com o valor antigo.\n\n**O que fazer.** Abra a entidade e defina-a novamente. Se falhar uma segunda vez, verifique se a válvula está online no aplicativo Kohler Konnect — uma válvula que caiu da nuvem aceita comandos que nunca chegam a ela.\n\nEsta mensagem desaparece quando uma alteração é verificada."
+    },
+    "durations_differ": {
+      "title": "Suas duas durações máximas de banho são diferentes",
+      "description": "O Chuveiro Infinito está ativado para **{valve}**, cujo limite de tempo de banho é de **{valve_minutes} minutos**, mas **{controller}** encerra o banho após **{controller_minutes} minutos**.\n\n**Por que isso importa.** O Chuveiro Infinito reinicia o banho quando o limite da válvula o pausa. Se o limite do controlador for diferente, o controlador pode encerrar o banho pelo próprio temporizador, e essa parada não pode ser desfeita.\n\n**O que fazer.** Ajuste os dois para o mesmo valor: o da válvula no app Kohler Konnect (ajustes do chuveiro → duração máxima do banho) ou com o controle Max Shower Duration desta integração, e o do controlador na própria página de ajustes dele. Esta mensagem desaparece quando os valores coincidirem — o valor do controlador é lido novamente quando o Home Assistant se reconecta à Kohler."
     }
   }
 }

@@ -177,16 +177,19 @@ position: `Outlet 1`, or `Outlet 2.1` on a multi-zone valve.
 | `Water Used This Month` | sensor | This calendar month's usage, from **Kohler's own history** — the same figure the Konnect app charts. Carries every month it returned as a `history` attribute |
 | `Water Used This Year` | sensor | The last **twelve complete months** from Kohler's own usage history, summed. The current partial month is excluded so the value changes once a month rather than creeping daily — `Water Used This Month` covers that |
 | `Shower on` | switch | Turns the shower on or off. From cold it opens **the valve's own default outlets**; if outlets are already open it preserves them |
-| `Rainhead`, `Showerhead`, `Handshower`, `Tub Filler` | switch | One per outlet, named after the fixture the valve reports. See **Outlet names** below |
-| `Temperature` | number | Setpoint for that zone, in your account's unit. `Temperature 1` / `Temperature 2` on a two-zone valve |
+| `Rainhead`, `Showerhead`, `Handshower`, `Tub Filler`, `Body Sprays`, `Foot Sprays`… | switch | One per outlet, named after the fixture the valve reports. See **Outlet names** below |
+| `Temperature` | number | Setpoint for that zone, in your account's unit — the Konnect app's slider: **Cold**, then 59 °F up to the valve's current `Max Temperature`. The bottom step (58 °F / 14 °C) is **Cold**: the valve stops mixing in hot water, as the app's `COLD` stop does, and the `cold` attribute reads true. `Temperature 1` / `Temperature 2` on a two-zone valve |
 | `Flow` | number | Flow as a percentage, bounded by the limits the valve itself reports. `Flow 1` / `Flow 2` on a two-zone valve. See **Flow** below |
 | `Favorite` | select | Presets **stored on the valve**, added in the Konnect app or at the first-generation touchscreen |
+| `Experience` | select | The valve's stored **experiences** (Wake Up, Cool Down…), added in the Konnect app. Started with the same command the app uses — new in this release and not yet tried on hardware; see [Favorites and presets](#favorites-and-presets) |
 | `Warmup` | select | Off / All outlets / Selected outlets |
 | `Endless Shower` | switch | Re-open a zone the valve closed on its run-time limit |
 | `System Status` | sensor | `Water Running`, `Paused`, `Warming Up`, `Idle`. Whole-valve: warm-up and pause are system-level, not per-zone. Carries `seconds_remaining` — how long before the valve's run-time limit closes the water |
-| `System State` | sensor | The valve's own `normalOperation` / `showerInProgress` flag — a second opinion to `System Status`, decoded differently |
+| `System State` | sensor | The valve's own `normalOperation` / `showerInProgress` flag — a second opinion to `System Status`, decoded differently. Also `error` and `FirmwareUpdate`, which the Konnect app acts on but no install has yet been seen to send |
 | `At Temperature` | binary sensor | Whether the water has reached its setpoint |
-| `Problem` | binary sensor | Whether the valve reports a fault |
+| `Problem` | binary sensor | Whether the valve reports a fault — the error flag in its status word, or a `System State` of `error` |
+| `Firmware`, `Gateway Firmware` | update | Installed and latest firmware for the valve and its Wi-Fi gateway, checked twice a day. **Read-only** — install updates in the Konnect app, which guards against installing mid-shower |
+| `Restart` | button | Reboots the valve, as the app's *Restart Product* does. **Disabled by default** — a button can't ask "are you sure?", so enable it on purpose. Stops any running water; can't revive a valve that has dropped off the cloud |
 
 #### The three settings the Konnect app also has
 
@@ -213,11 +216,23 @@ current app; only an out-of-date one would quietly undo it.
 #### Outlet names
 
 Outlet switches are named after the fixture the valve reports for that outlet, not its
-position. Four type codes have confirmed meanings — handshower, showerhead, tub filler and
-rainhead — and an outlet whose code is not one of them keeps the positional form,
-`Zone N Outlet M`, rather than being given an invented name. If yours shows a position where
-you expected a name, please open an issue with the switch's `outlet_type` attribute and what
-the fixture actually is.
+position. The names come from the Konnect app's own outlet list — every type a valve can be
+set up with:
+
+| Code | Name | Variant (`outlet_variant` attribute) |
+|---|---|---|
+| 1 | Handshower | |
+| 11 / 12 | Showerhead / Showerheads | |
+| 21 | Tub Filler | |
+| 30 | Not Plumbed | |
+| 31–39 | Rainhead | Katalyst, Cascade, Kinetic, Rain Curtain, Laminar, Massage (Wave), Hydro Massage, Silk, Real Rain |
+| 51 / 52 / 53 | Body Spray / Body Sprays / Body Spray | Single, Multiple, Massage (Wave) |
+| 61 / 62 | Foot Spray / Foot Sprays | Single, Multiple |
+
+An outlet whose type the valve hasn't reported yet keeps the positional form, `Outlet 1` or
+`Outlet 2.1`. When a name later arrives — on a restart after the valve reports it, or because
+this release learned a code that earlier ones didn't (38, 39 and 62 were unknown before) — the
+switch is **renamed in place**: its entity id, history and automations stay as they were.
 
 On a **single-zone valve the `Zone N ` prefix is dropped** throughout — there is nothing to
 disambiguate. A two-zone valve keeps it. Two outlets of the same fixture in one zone are
@@ -249,7 +264,12 @@ reading.
 | `System Status` | sensor | `Water Running`, `Warming Up`, `Idle` |
 | `Zone N Temperature` | sensor | Read-only; the controller offers no live temperature control |
 | `Zone N Outlet M` | binary sensor | Read-only outlet state as the controller sees it |
-| `Music` / `Light` / `Steam` | binary sensor | Read-only accessory state |
+| `Steam` | switch | Starts or stops the steam generator at **the controller's own default temperature and time**, as the app's *Steam start* card does. Refused while the controller is running the shower — the app won't run both at once. Only on controllers with steam attached. New in this release and not yet tried on hardware |
+| `Experience` | select | The controller's experiences — shower, steam and ice-shower programs such as Breathe, Focus or Detox — started and shown running. They run from zone 1's first outlet, as the app notes |
+| `Music` / `Light` / `Steam` | binary sensor | Accessory state. `Light` carries each light group's own state; `Steam` carries temperature, timers and `power_clean` (the generator's self-clean) |
+| `Problem` | binary sensor | A fault the controller reports, an active error (its title and code are attributes), or an accessory that is set up but has stopped responding — "Steam is disconnected", an SD card missing — the cases the app shows as error cards |
+| `Max Shower Duration` | sensor | The controller's own limit on a shower, in minutes. Endless Shower needs it to match the valve's — see [Endless Shower](#endless-shower) |
+| `Firmware` | update | Installed and latest controller firmware, checked twice a day. Read-only |
 
 <details>
 <summary><b>Diagnostic entities</b> — mostly disabled by default, for protocol work rather than daily use</summary>
@@ -431,7 +451,7 @@ thing in YAML:
 action: kohler_anthem.custom_shower
 data:
   device_id: 1a2b3c…          # only with more than one valve: the valve device's id
-  zone1_temperature: 108      # in your account's unit; the slider covers 92–118 °F
+  zone1_temperature: 108      # in your account's unit; 59–118 °F
   zone1_outlet_1: true        # outlets you leave out are closed
   keep_on_after_warmup: true  # optional and beta, see below
 ```
@@ -442,7 +462,7 @@ Every field the action takes, with what each one does when you leave it out:
 action: kohler_anthem.custom_shower
 data:
   # Zone 1 — the only required field is the temperature
-  zone1_temperature: 108      # required; your account's unit, 92–118 °F or 33–48 °C
+  zone1_temperature: 108      # required; your account's unit, 59–118 °F or 15–48 °C
   zone1_outlet_1: true        # default false — an outlet you leave out is closed
   zone1_outlet_2: false
   zone1_outlet_3: false
@@ -516,15 +536,12 @@ layout.
 > ⚠️ **This can start water.** It writes directly to the valve with none of the guards the
 > switches apply.
 
-### `kohler_anthem.probe_usage`
+The temperature range is the zone slider's without its **Cold** step: typing `0` is refused
+rather than giving you a cold shower. Use the slider's bottom step, or `send_valve_hex`, for
+full cold.
 
-An exploratory, read-only action that calls Kohler's `gcs-usage` endpoint with a list of
-candidate query parameters and writes what each returns to
-`custom_components/kohler_anthem/reports/usage_probe_<timestamp>.json`. It changes nothing on
-the valve. Mainly useful if you want to see the raw usage-history responses behind
-`Water Used This Month` / `Water Used This Year`; most users won't need it. Run it from
-**Developer Tools → Actions**, pick the valve, and attach the resulting file to an issue if
-asked. Skim it first — it contains your device id.
+> **`probe_usage` has been removed.** It existed to discover how Kohler's usage-history
+> endpoint wanted to be called; that is now known, and the usage sensors already use it.
 
 ## Features in detail
 
@@ -533,6 +550,14 @@ asked. Skim it first — it contains your device id.
 The valve stores presets; the controller stores named favorites. Both are exposed as
 `select` entities, and both are configured in the Konnect app rather than here — this
 integration activates them, it doesn't create them.
+
+**Experiences** are Kohler's built-in programs — on the valve, ones you've added in the app
+(Wake Up, Cool Down, the ice-shower routines); on the controller, its fixed catalogue of
+shower, steam and ice-shower programs. Each device has its own `Experience` dropdown. The
+valve's starts with the same command the Konnect app sends, but earlier versions of this
+integration believed the valve ignored it, and nobody has yet confirmed it on hardware — if
+choosing one does nothing, the dropdown falls back to `Off` after a few seconds. Please open an
+issue either way.
 
 ### Warmup
 
@@ -580,6 +605,18 @@ producing a shower that doesn't stop on its own.
 
 > ⚠️ This deliberately defeats a safety-adjacent limit. It is off by default, and you should
 > understand why that limit exists on your installation before turning it on.
+
+**With an Anthem Plus controller, the two Max Shower Durations must match.** The controller
+runs its own limit, and when it is longer than the valve's it can end a shower that Endless
+Shower is keeping alive, in a way that can't be undone. The controller's value is now
+readable from Kohler's cloud, so when Endless Shower is on and the two differ, a **repair
+notice** names both. Set them equal — the valve's with `Max Shower Duration`, the
+controller's on its own settings page — and it clears the next time Home Assistant
+reconnects to Kohler.
+
+Stopping the shower from the **Konnect app** or the **first-generation touchscreen** within a
+few seconds of the valve's limit can restart it: both stop the valve the same way the limit
+does. Stopping from Home Assistant never can.
 
 ### Captures and journals
 
@@ -839,9 +876,14 @@ Konnect app.
   scaling and a calibration-derived ceiling. On such an install a setpoint written from Home
   Assistant can change on its own; disable the entity if yours behaves that way. The protocol
   layer is unaffected either way.
-* **Music, lighting and steam are read-only.** The controller exposes them as state; driving
-  them means activating a favorite that includes them. This is the limit of what **Konnect**
-  exposes, not what the hardware can do.
+* **Music and lighting are read-only; steam runs only its defaults.** The controller exposes
+  music and lighting as state, and steam's only direct command runs the controller's default
+  program; anything else means activating a favorite that includes it. The Konnect app has
+  no other command for any of them — this is the limit of what **Konnect** exposes, not what
+  the hardware can do.
+* **New controls are app-confirmed, not hardware-confirmed.** The `Steam` switch, both
+  `Experience` dropdowns and the valve's `Restart` button send exactly what the Konnect app
+  sends, but none has been run against hardware by this integration yet.
 * **Which controller fronts which valve is not knowable.** Nothing on the cloud side says
   it, so on an account with more than one valve or more than one controller the valve's
   `Status` no longer folds in a controller-initiated warm-up — it reads the valve alone and
@@ -882,6 +924,7 @@ of it.
 |---|---|
 | [`gcs/valve_hex.md`](gcs/valve_hex.md) | The valve command word, byte by byte — for `send_valve_hex` |
 | [`mqtt/capture_runbook.md`](mqtt/capture_runbook.md) | Capturing and reading diagnostics |
+| [`protocol/`](protocol/README.md) | **For developers.** Kohler Konnect's cloud protocol — sign-in, every endpoint and message this integration uses, status codes, firmware, and what the Konnect app does that this integration doesn't. Written to be reused by other Kohler integrations |
 
 Issue reports from **different hardware** are the most useful thing anyone can contribute — a
 single-zone valve, a four-outlet valve, or a valve with no controller in front of it would

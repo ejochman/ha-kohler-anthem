@@ -166,13 +166,21 @@ def get_valve_model(sku: str) -> ValveModel:
 
 
 # ---------------------------------------------------------------------------
-# Unverified assumption, flagged deliberately
+# App-confirmed, not yet hardware-confirmed
 # ---------------------------------------------------------------------------
 # On a 2-outlet valve (K-28209, and each half of a K-28211), outlets are assumed to use
 # mask bits 0 and 1 — the same low bits a 3-outlet valve uses for its first two outlets.
-# This has NOT been confirmed on hardware: the only system tested has 3-outlet valves. If
-# a 2-outlet valve turns out to use different bits, `outlet_location` is the single place
-# to correct it.
+#
+# **Konnect 3.0.6 does exactly this** (2026-10-07, `db0/c.java`): it sorts each valve's
+# `outletConfigurations` by `outLetId` and maps list index *i* to bit *i*, so a K-28209 drives
+# valve 1 with 0x01/0x02 and a K-28211's zone 2 drives valve 2 with 0x01/0x02. Its setup
+# screens number `outLetId` as position−1 except on a 4-port valve, whose zone 2 keeps ids 3
+# and 4 — the mapping `outlet_id` implements and PR #2 confirmed on a live K-28211.
+#
+# Left `False` because the flag means *hardware*-verified, and nobody has yet reported
+# toggling each outlet on a 2-outlet valve and watching the right head run. One such report
+# flips it. If a 2-outlet valve ever disagrees, `outlet_location` is the single place to
+# correct it.
 TWO_OUTLET_BIT_MAPPING_VERIFIED = False
 
 

@@ -26,7 +26,15 @@ from homeassistant.helpers.entity import EntityCategory
 
 from .conftest import make_controller, make_coordinator, make_valve
 
-PLATFORMS = ("number", "switch", "sensor", "binary_sensor", "select", "button")
+PLATFORMS = (
+    "number",
+    "switch",
+    "sensor",
+    "binary_sensor",
+    "select",
+    "button",
+    "update",
+)
 
 
 def platform(name: str):
@@ -491,48 +499,27 @@ def test_flow_rounds_a_half_percent_reading_for_display():
 
 
 # --------------------------------------------------------------------------- #
-# The gcs-usage probe
+# The gcs-usage contract
 # --------------------------------------------------------------------------- #
-def test_usage_probe_candidates_all_render():
-    """Every candidate must survive substitution — one bad placeholder breaks the run.
+def test_usage_probe_is_gone_and_the_contract_is_recorded():
+    """`probe_usage` existed to learn `gcs-usage`'s contract; Konnect 3.0.6 settled it.
 
-    The probe makes real network calls, so a `KeyError` here would surface as a failed
-    service call against live hardware rather than a test failure.
+    The action is gone, and the endpoint's documentation must say what the app actually
+    sends — `Day`/`Month` with `MM-dd-yyyy` — and that `WEEK` is not an interval at all,
+    so nobody reopens the question by probing again.
     """
-    from custom_components.kohler_anthem.services import (
-        _USAGE_ATTEMPTS,
-        usage_probe_substitutions,
-    )
-
-    # The service's own values, not a copy: a placeholder added to a candidate but not to
-    # the substitutions is a KeyError against live hardware, which a duplicated dict here
-    # would happily miss.
-    substitutions = usage_probe_substitutions()
-    assert _USAGE_ATTEMPTS
-    # The decompiled contract is PascalCase. camelCase is what made the first fifteen
-    # candidates fail, so a regression to it is worth catching here.
-    parameterised = [query for _, query in _USAGE_ATTEMPTS if query]
-    assert parameterised
-    for query in parameterised:
-        assert "FromDate=" in query and "ToDate=" in query and "Interval=" in query, (
-            query
-        )
-    labels = [label for label, _ in _USAGE_ATTEMPTS]
-    assert len(labels) == len(set(labels)), labels
-    for _label, query in _USAGE_ATTEMPTS:
-        query.format(**substitutions)
-
-
-def test_usage_probe_is_read_only():
-    """The probe must only ever GET. It exists to learn, not to change anything."""
-    import inspect
-
+    from custom_components.kohler_anthem import const, services
     from custom_components.kohler_anthem.anthem import client
+    from custom_components.kohler_anthem.anthem import const as protocol
 
-    source = inspect.getsource(client.KohlerClient.async_probe_usage)
-    assert '"GET"' in source
-    for verb in ('"POST"', '"PATCH"', '"PUT"', '"DELETE"'):
-        assert verb not in source, verb
+    assert not hasattr(client.KohlerClient, "async_probe_usage")
+    assert not hasattr(const, "SERVICE_PROBE_USAGE")
+    assert not hasattr(services, "_USAGE_ATTEMPTS")
+    import pathlib
+
+    source = pathlib.Path(protocol.__file__).read_text(encoding="utf-8")
+    block = source[source.index("Water usage history") : source.index("GCS_USAGE =")]
+    assert "MM-dd-yyyy" in block and "never sends `WEEK`" in block
 
 
 # --------------------------------------------------------------------------- #
@@ -629,6 +616,7 @@ def test_every_controller_platform_constructs():
         "sensor",
         "binary_sensor",
         "select",
+        "update",
     }, {name: len(entities) for name, entities in built.items()}
     total = sum(len(entities) for entities in built.values())
     assert total >= 10, built
@@ -690,7 +678,7 @@ def test_controller_zone_names_match_the_valve_scheme():
 # Services
 # --------------------------------------------------------------------------- #
 def test_every_registered_service_is_also_unregistered():
-    """0.7.7 added `probe_usage` to registration and forgot the unload path.
+    """0.7.7 added a service (`probe_usage`, since retired) and forgot the unload path.
 
     The action then outlived the last unload with nothing behind it, and calling it reported
     "no Anthem valve on this account" rather than simply not existing. Asserted by reading
@@ -1529,26 +1517,54 @@ def _temperature_number(valve_model, unit):
 
 
 def test_the_temperature_slider_matches_the_app():
-    """92-118 °F — exactly the Konnect app's own slider, owner-confirmed 2026-09-10.
+    """Cold, then 59 °F up to the valve's own scald limit — the Konnect app's zone slider.
 
-    It was 80-113 before 0.12.0, both ends invented rather than taken from the app. The
-    ceiling was justified as "exactly the `maximumOutletTemperature` the valve reports for
-    every outlet" — generalised from the reference valve, and false: the owner's two valves
-    report 450 tenths (113 °F) and 477 tenths (117.9 °F). A control whose range differs from
-    the app reads as broken rather than cautious.
+    Konnect 3.0.6 bounds it from a `COLD` stop one below `minimumOutletTemperature` to the
+    valve's *current* `maximumOutletTemperature`. The fixture valve reports 150 and 477
+    tenths, so 58 (Cold) to 118 °F. It was a fixed 92-118 °F until 2026-10-07 — the Max
+    Temperature *setting's* range, mistaken for this control's.
     """
     from homeassistant.const import UnitOfTemperature
 
     from custom_components.kohler_anthem.anthem.models import get_valve_model
 
     number = _temperature_number(get_valve_model("K-28210"), "Fahrenheit")
-    assert number.native_min_value == 92
+    assert number.native_min_value == 58
     assert number.native_max_value == 118
     assert number.native_unit_of_measurement == UnitOfTemperature.FAHRENHEIT
 
 
+def test_the_temperature_slider_follows_the_valves_scald_limit():
+    """Raise Max Temperature in the app and the zone slider widens, as the app's does."""
+    from custom_components.kohler_anthem.anthem.models import get_valve_model
+
+    number = _temperature_number(get_valve_model("K-28210"), "Fahrenheit")
+    for limits in number._valve.gcs_state.outlet_limits.values():
+        limits.maximum_temperature_tenths = 450
+    assert number.native_max_value == 113
+
+
+def test_the_cold_stop_sends_full_cold_and_reads_back_as_cold():
+    """The bottom step is the app's COLD: it writes 0 °C, and a 0 °C valve shows on it."""
+    from custom_components.kohler_anthem.anthem.models import get_valve_model
+
+    number = _temperature_number(get_valve_model("K-28210"), "Fahrenheit")
+    sent: dict = {}
+
+    async def apply(**kwargs):
+        sent.update(kwargs)
+
+    number._valve.async_apply_valve = apply
+    asyncio.run(number.async_set_native_value(number.native_min_value))
+    assert sent == {"zone1_temperature": 32.0}
+
+    number._valve.gcs_state.valve1.temperature_celsius = 0.0
+    assert number.native_value == number.native_min_value
+    assert number.extra_state_attributes["cold"] is True
+
+
 def test_the_celsius_slider_stays_inside_the_codec_ceiling():
-    """33-48 °C, and 48 must not exceed what `encode_word` will accept (48.8 °C)."""
+    """14 (Cold) to 48 °C, and the top must not exceed what `encode_word` accepts."""
     from custom_components.kohler_anthem.anthem.models import get_valve_model
     from custom_components.kohler_anthem.anthem.valve_hex import (
         TEMPERATURE_MAX_TENTHS,
@@ -1556,7 +1572,7 @@ def test_the_celsius_slider_stays_inside_the_codec_ceiling():
     )
 
     number = _temperature_number(get_valve_model("K-28210"), "Celsius")
-    assert number.native_min_value == 33
+    assert number.native_min_value == 14
     assert number.native_max_value == 48
     ceiling = TEMPERATURE_MAX_TENTHS / TEMPERATURE_TENTHS_PER_DEGREE
     assert number.native_max_value <= ceiling, (
@@ -1572,17 +1588,36 @@ def test_the_service_schema_matches_the_slider():
     """
     from custom_components.kohler_anthem.const import (
         UI_TEMPERATURE_MAX_F,
-        UI_TEMPERATURE_MIN_F,
+        ZONE_TEMPERATURE_MIN_F,
     )
     from custom_components.kohler_anthem.services import (
         _FIELD_ZONE1_TEMPERATURE,
         _FIELD_ZONE2_TEMPERATURE,
+        _temperature_bounds,
     )
 
+    # The slider less its Cold stop, which a typed form deliberately cannot reach.
     for field in (_FIELD_ZONE1_TEMPERATURE, _FIELD_ZONE2_TEMPERATURE):
         selector = field["selector"]["number"]
         assert selector["max"] == UI_TEMPERATURE_MAX_F, field["name"]
-        assert selector["min"] == UI_TEMPERATURE_MIN_F, field["name"]
+        assert selector["min"] == ZONE_TEMPERATURE_MIN_F, field["name"]
+    assert _temperature_bounds("Fahrenheit")[:2] == (59.0, 118.0)
+
+    import yaml
+
+    with open(
+        "custom_components/kohler_anthem/services.yaml", encoding="utf-8"
+    ) as handle:
+        described = yaml.safe_load(handle)
+    seen = 0
+    for key, section in described["custom_shower"]["fields"].items():
+        nested = section.get("fields") or {key: section}
+        for name, field in nested.items():
+            if name.endswith("_temperature"):
+                seen += 1
+                assert field["selector"]["number"]["min"] == ZONE_TEMPERATURE_MIN_F
+                assert field["selector"]["number"]["max"] == UI_TEMPERATURE_MAX_F
+    assert seen, "no temperature fields found in services.yaml"
 
 
 def test_118f_encodes_to_the_valve_without_being_clamped():
@@ -2084,6 +2119,13 @@ class _SeedRecorder:
     async def async_get_gcs_configuration(self, device_id):
         return await self._read("configuration")
 
+    async def async_get_gcs_about(self, device_id):
+        # Mirrors the real client, which answers {} rather than raising.
+        try:
+            return await self._read("about")
+        except Exception:
+            return {}
+
     async def async_get_gcs_presets(self, device_id):
         return await self._read("presets")
 
@@ -2150,9 +2192,9 @@ async def test_seed_is_two_round_trips_deep_not_five():
     await valve.async_seed()
     elapsed = time.monotonic() - start
 
-    # Six: settings, state, configuration, presets, and the two usage series (monthly and
-    # daily), which overlap each other as well as the ordered pair.
-    assert len(client.started) == 6, client.started
+    # Seven: settings, state, configuration, presets, the two usage series (monthly and
+    # daily) and the per-part `about`, which overlap each other as well as the ordered pair.
+    assert len(client.started) == 7, client.started
     # Still two round trips deep (~0.10s) plus slack; six serial would be ~0.30s.
     assert elapsed < 0.20, f"seed took {elapsed:.3f}s — reads went serial again"
 
@@ -2173,6 +2215,7 @@ async def test_one_failed_seed_read_does_not_blank_the_others():
         "configuration",
         "presets",
         "usage",
+        "about",
     }
     # A failed configuration read latches {} so a reconnect does not retry static data.
     assert valve.configuration == {}
@@ -2434,50 +2477,6 @@ def test_max_shower_duration_publishes_attributes_without_raising():
         "Showerhead",
         "Handshower",
     ]
-
-
-def test_usage_probe_separates_interval_from_range():
-    """WEEK **is** supported — the Konnect app shows weekly stats on this same account.
-
-    So the 400 it once returned was not an unsupported interval. It was asked over 400 days,
-    which is ~57 weekly buckets against the 13 monthly ones that succeeded, and a row cap
-    answers with the same generic 400 — the test could never have told the two apart.
-
-    The question now is which request shape works, so several WEEK ranges must be asked with
-    the original long call kept as a control. DAY is asked on the same reasoning: it was
-    never tried at all, yet the MONTH-only conclusion was written as though it had been.
-    """
-    from custom_components.kohler_anthem.services import (
-        _USAGE_ATTEMPTS,
-        usage_probe_substitutions,
-    )
-
-    rendered = {
-        label: query.format(**usage_probe_substitutions())
-        for label, query in _USAGE_ATTEMPTS
-    }
-    weeks = [q for label, q in rendered.items() if "Interval=WEEK" in q]
-    assert len(weeks) >= 3, "need several WEEK ranges to locate where the limit bites"
-    assert any("Interval=DAY" in q for q in rendered.values())
-    # The short calls must actually be shorter, or they test nothing.
-    import re
-    from datetime import date
-
-    def span_days(query: str) -> int:
-        frm, to = (
-            date.fromisoformat(m)
-            for m in re.findall(r"Date=(\d{4}-\d{2}-\d{2})", query)
-        )
-        return (to - frm).days
-
-    spans = sorted(span_days(q) for q in weeks)
-    # A short range (roughly what the app's week tab shows), a middling one, and the original
-    # long call kept as the control. Where those diverge locates the real constraint.
-    assert spans[0] <= 30, f"need a short WEEK range; spans are {spans}"
-    assert spans[-1] >= 365, (
-        f"keep the original long call as a control; spans are {spans}"
-    )
-    assert len(set(spans)) == len(spans), f"WEEK ranges must differ; spans are {spans}"
 
 
 # --------------------------------------------------------------------------- #
@@ -2907,7 +2906,7 @@ def test_duration_reports_a_value_the_app_cannot_offer_honestly(valve_model):
 
 
 def test_the_write_body_is_the_whole_record_in_wire_units():
-    """Ten string keys, write-side spellings, tenths and flow bytes — never the read keys."""
+    """Twelve string keys, write-side spellings, tenths and flow bytes — never the read keys."""
     from custom_components.kohler_anthem.anthem.gcs import GcsDevice
     from custom_components.kohler_anthem.anthem.state import OutletLimits
 
@@ -2930,8 +2929,12 @@ def test_the_write_body_is_the_whole_record_in_wire_units():
     )
     model = sent["gcsOutletConfigControlModel"]
 
-    # The app's eleven less `maxVolume`, which neither read surface carries.
-    assert len(model) == 10
+    # Konnect 3.0.6 sends twelve (`GcsOutletConfigurationsModel`): the ten read back plus
+    # `maxVolume` and `purge`, which no captured read carries, so they go as the app sends
+    # them when unread.
+    assert len(model) == 12
+    assert model["maxVolume"] == "0"
+    assert model["purge"] == ""
     assert all(isinstance(v, str) for v in model.values())
     # Write-side spellings: lowercase t/r. The read side capitalises them, and Gson drops
     # unmatched keys silently while still returning 201.
@@ -2948,6 +2951,59 @@ def test_the_write_body_is_the_whole_record_in_wire_units():
     assert model["minimumOutletTemperature"] == "150"
     assert model["maximumRuntime"] == "1800"
     assert model["outLetFlags"] == "1"
+
+
+def test_the_write_echoes_max_volume_and_purge_when_the_valve_reported_them():
+    """Read-back values win over the app's defaults — a whole-record write puts back what it found."""
+    from dataclasses import replace
+
+    from custom_components.kohler_anthem.anthem.gcs import GcsDevice
+    from custom_components.kohler_anthem.anthem.state import OutletLimits
+
+    sent: dict = {}
+
+    class _Client:
+        tenant_id = "tenant-guid"
+
+        async def async_request(self, method, path, json_body=None):
+            sent.update(json_body)
+
+    device = GcsDevice.__new__(GcsDevice)
+    device._client = _Client()
+    device.device_id = "gcs-x"
+    limits = replace(
+        OutletLimits(0, 16, 200, 1800, 200, 21, 477, 150, 388, 1),
+        max_volume="150",
+        purge="1",
+    )
+    asyncio.run(device.async_write_outlet_config(limits, maximum_run_time=900))
+    model = sent["gcsOutletConfigControlModel"]
+    assert model["maxVolume"] == "150"
+    assert model["purge"] == "1"
+
+
+def test_mqtt_outlet_config_keeps_max_volume_learned_earlier():
+    """A thin announcement must not blank a field a write will echo."""
+    from custom_components.kohler_anthem.anthem.models import get_valve_model
+    from custom_components.kohler_anthem.anthem.mqtt import Envelope
+    from custom_components.kohler_anthem.anthem.state import GcsState
+
+    state = GcsState(model=get_valve_model("K-28210"))
+
+    def announce(**extra):
+        attribute = {
+            "outLetId": "0",
+            "minimumFlowRate": "16",
+            "maximumFlowRate": "200",
+            **extra,
+        }
+        state.apply_envelope(
+            Envelope("GCS", "gcs-x", "READ_GCS_OUTLET_CONFIG_CFG", [attribute], 1.0)
+        )
+
+    announce(maxVolume="120")
+    announce()
+    assert state.outlet_limits[0].max_volume == "120"
 
 
 def test_a_write_refuses_rather_than_inventing_a_field():
@@ -3464,7 +3520,7 @@ def test_k28211_hardware_outlet_ids_skip_unused_valve1_slot():
                     },
                     {
                         "outLetId": "1",
-                        "outLetType": "62",  # purposely unknown outlet type
+                        "outLetType": "99",  # outside the app's outlet table
                         "minimumFlowrate": "12.5",
                         "maximumFlowrate": "50",
                         "maximumRuntime": "1800",
@@ -3513,8 +3569,9 @@ def test_k28211_hardware_outlet_ids_skip_unused_valve1_slot():
     assert holder.outlets_awaiting_run_time == []
     assert holder._zone_limits() == {1: (1800,), 2: (1800,)}
 
-    # 62 is a purposely unknown outlet type to verify the "Outlet 1.2" fallback
-    valve = make_valve(model, [11, 62, 31, 1])
+    # 99 is outside Konnect's outlet table (62 is a pair of foot sprays since 2026-10-07),
+    # to verify the "Outlet 1.2" fallback
+    valve = make_valve(model, [11, 99, 31, 1])
     valve.gcs_state = state
     valve.outlet_run_times = holder.outlet_run_times
     assert [

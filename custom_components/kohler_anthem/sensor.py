@@ -26,6 +26,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     UnitOfTemperature,
+    UnitOfTime,
     UnitOfVolume,
 )
 from homeassistant.core import HomeAssistant
@@ -135,6 +136,9 @@ async def async_setup_entry(
         # Diagnostic, and about the controller's *reporting* rather than the water, so it is
         # created for every controller — unlike everything gated below.
         entities.append(ControllerLastUpdateSensor(coordinator, controller))
+        # The controller's own cap on a shower — what Endless Shower needs to match. Read
+        # from `hub-configuration`, so created for every controller.
+        entities.append(ControllerMaxShowerDurationSensor(coordinator, controller))
 
         if controller_water:
             entities += [
@@ -279,6 +283,10 @@ class ValveStatusSensor(KohlerValveEntity, SensorEntity):
 class ValveSystemStateSensor(KohlerValveEntity, SensorEntity):
     """The valve's own `currentSystemState` — `normalOperation` or `showerInProgress`.
 
+    Two more are declared since 2026-10-07 because Konnect 3.0.6 acts on them, though no
+    capture has carried either: ``error`` (a valve fault — the Problem sensor turns on too)
+    and ``FirmwareUpdate`` (an install in progress). Before, both would have read unknown.
+
     **A second opinion, not a restatement of `Status`.** `Status` is decoded from the
     command word — outlet mask, pause flag, warm-up — whereas this is a flag the valve
     sets for itself. They usually agree, and when they do not, that disagreement is the
@@ -294,11 +302,16 @@ class ValveSystemStateSensor(KohlerValveEntity, SensorEntity):
     _attr_name = "System State"
     _attr_icon = "mdi:state-machine"
     _attr_device_class = SensorDeviceClass.ENUM
-    # The two values observed across the whole capture corpus. An unrecognised value is
-    # published as-is by returning None below rather than being forced into this list,
-    # since an ENUM sensor reporting an option it never declared is logged as an error by
-    # Home Assistant on every single update.
-    _attr_options: ClassVar[list[str]] = ["normalOperation", "showerInProgress"]
+    # The two values observed across the whole capture corpus, plus the two Konnect 3.0.6
+    # handles. An unrecognised value is published as-is by returning None below rather
+    # than being forced into this list, since an ENUM sensor reporting an option it never
+    # declared is logged as an error by Home Assistant on every single update.
+    _attr_options: ClassVar[list[str]] = [
+        "normalOperation",
+        "showerInProgress",
+        "error",
+        "FirmwareUpdate",
+    ]
 
     def __init__(self, coordinator: KohlerAnthemCoordinator, valve: Valve) -> None:
         super().__init__(coordinator, valve)
@@ -310,8 +323,11 @@ class ValveSystemStateSensor(KohlerValveEntity, SensorEntity):
         if state is None or state.system_state is None:
             return None
         value = state.system_state
+        # The app compares `error` case-insensitively; so does this.
+        if value.strip().lower() == "error":
+            return "error"
         # Never hand HA an option outside `_attr_options` — see the class docstring. A
-        # firmware that adds a third state shows as `unknown` here and in the attribute
+        # firmware that adds another state shows as `unknown` here and in the attribute
         # below as its real string, rather than spamming the log.
         return value if value in self._attr_options else None
 
@@ -599,6 +615,11 @@ class _DailyWaterSensor(KohlerValveEntity, SensorEntity):
         litres = 0.0
         days: dict[str, float] = {}
         volumes: dict[date, float] = {}
+        # `numberOfTimesValveSwitchedOn` rides in every bucket beside `volume` — how many
+        # times the shower was turned on that day. A plain count, so published as is.
+        # (`averageBlendTemperature` rides there too, but nothing — the app included —
+        # states its unit, so it is left out rather than shown in a guessed one.)
+        starts: dict[date, int] = {}
         for entry in usage_series(usage):
             interval = entry.get("intervalKey")
             bucket = _usage_bucket_date(interval)
@@ -608,7 +629,13 @@ class _DailyWaterSensor(KohlerValveEntity, SensorEntity):
             if not isinstance(volume, (int, float)):
                 continue
             volumes[bucket] = volumes.get(bucket, 0.0) + float(volume)
+            count = entry.get("numberOfTimesValveSwitchedOn")
+            if isinstance(count, (int, float)) or (
+                isinstance(count, str) and count.isdigit()
+            ):
+                starts[bucket] = starts.get(bucket, 0) + int(count)
 
+        turned_on: int | None = None
         for day in wanted:
             bucket = day
             # Some accounts appear to expose the daily chart on UTC bucket labels. In US
@@ -624,6 +651,8 @@ class _DailyWaterSensor(KohlerValveEntity, SensorEntity):
             volume = volumes.get(bucket)
             if volume is None:
                 continue
+            if bucket in starts:
+                turned_on = (turned_on or 0) + starts[bucket]
             litres += volume
             days[bucket.isoformat()] = round(
                 volume if self._metric else usage_volume_gallons(volume),
@@ -636,6 +665,8 @@ class _DailyWaterSensor(KohlerValveEntity, SensorEntity):
             value = litres if self._metric else usage_volume_gallons(litres)
             total = round(value, 1)
             attributes = {"days_counted": len(days)}
+            if turned_on is not None:
+                attributes["times_turned_on"] = turned_on
             if self._days == 1 and days:
                 bucket_date = next(iter(days))
                 if bucket_date != local_today.isoformat():
@@ -965,6 +996,37 @@ class ControllerLastUpdateSensor(ControllerDiagnosticSensor):
         if state is None or state.last_update is None:
             return None
         return datetime.fromtimestamp(state.last_update, tz=UTC)
+
+
+class ControllerMaxShowerDurationSensor(ControllerDiagnosticSensor):
+    """The controller's Max Shower Duration, in minutes.
+
+    From ``hub-configuration`` ``systemSettings.maxShowerDuration`` — readable from the
+    cloud, which this integration did not know until Konnect 3.0.6 showed the app reading it
+    (2026-10-07). It is the number Endless Shower needs to match the valve's own limit; when
+    they differ the integration raises a Repairs card, and this is where to read the
+    controller's side. Re-read on each reconnect, not live: an edit on the controller shows
+    here after the next one.
+
+    Enabled by default, unlike the other controller diagnostics, because it is a setting
+    someone has to act on rather than a protocol curiosity.
+    """
+
+    _attr_name = "Max Shower Duration"
+    _attr_icon = "mdi:timer-cog-outline"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
+    _attr_entity_registry_enabled_default = True
+
+    def __init__(
+        self, coordinator: KohlerAnthemCoordinator, controller: Controller
+    ) -> None:
+        super().__init__(coordinator, controller)
+        self._attr_unique_id = f"{self._device_id}_max_shower_duration"
+
+    @property
+    def native_value(self) -> int | None:
+        return self._controller.settings.max_shower_duration_minutes
 
 
 class ControllerStatusSensor(KohlerControllerEntity, SensorEntity):

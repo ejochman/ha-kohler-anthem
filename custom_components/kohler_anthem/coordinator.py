@@ -36,6 +36,7 @@ from homeassistant.exceptions import (
 )
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -54,6 +55,7 @@ from .anthem import (
     GcsState,
     HubCapabilities,
     HubDevice,
+    HubSettings,
     HubState,
     KohlerAuth,
     KohlerClient,
@@ -115,6 +117,7 @@ from .const import (
     ENDLESS_SHOWER_NOTHING_TO_RESTORE,
     ENDLESS_SHOWER_ON,
     ENDLESS_SHOWER_RESTARTED,
+    ISSUE_DURATION_MISMATCH,
     ISSUE_NOT_SET_UP,
     OUTLET_WRITE_VERIFY_DELAY_SECONDS,
     RAW_MQTT_LOG_DIR,
@@ -326,6 +329,40 @@ def _controller_offline(controller: Controller) -> str:
     )
 
 
+#: How often firmware availability is re-read. Twice a day: a release is rare, and the update
+#: entity only has to notice one within hours, not minutes.
+FIRMWARE_CHECK_INTERVAL = timedelta(hours=12)
+
+
+def _experience_title(item: dict[str, Any]) -> str:
+    """An experience's title — the string its control body names it by."""
+    return str(item.get("title") or item.get("name") or "").strip()
+
+
+def _experiences_by_category(payload: Any) -> dict[str, list[dict[str, Any]]]:
+    """`hub-experience/{id}/experiences` -> `{category: [experience, ...]}`.
+
+    Accepts the payload with or without its `experiences` wrapper. Only the three categories
+    an endpoint exists for are kept, and entries without a title are dropped: the title is
+    what the control body carries.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    source = payload.get("experiences")
+    source = source if isinstance(source, dict) else payload
+    result: dict[str, list[dict[str, Any]]] = {}
+    for category in ("showerExperiences", "steamExperiences", "iceShowerExperiences"):
+        items = source.get(category)
+        kept = [
+            item
+            for item in (items if isinstance(items, list) else [])
+            if isinstance(item, dict) and _experience_title(item)
+        ]
+        if kept:
+            result[category] = kept
+    return result
+
+
 class Controller:
     """One Anthem Plus system controller, with everything the coordinator keeps for it.
 
@@ -354,6 +391,19 @@ class Controller:
         #: This controller's favorites — seeded over REST, then replaced wholesale by every
         #: `FAVORITES_SNAPSHOT`. Ids are reassigned on delete, so always resolve by name.
         self.favorites: list[dict[str, Any]] = []
+        #: The controller's own settings from `hub-configuration` — Max Shower Duration,
+        #: steam defaults, light groups, LAN address, and which fitted accessories have
+        #: dropped off. Re-read on every seed, unlike `capabilities`: these are settings
+        #: an owner changes, not installation facts.
+        self.settings = HubSettings()
+        #: The controller's experience programs, by category (`showerExperiences`,
+        #: `steamExperiences`, `iceShowerExperiences`) — the firmware's fixed catalogue,
+        #: read once.
+        self.experiences: dict[str, list[dict[str, Any]]] = {}
+        #: `hub-diagnostics/{id}/active` `errorDetails[]`, refreshed on each seed.
+        self.active_errors: list[dict[str, Any]] = []
+        #: The firmware read for this controller (`firmware/hub`), refreshed twice a day.
+        self.firmware_info: dict[str, Any] = {}
 
     @property
     def device_id(self) -> str:
@@ -614,6 +664,13 @@ class Valve:
         # yet"; `{}` means the read was attempted and produced nothing usable, which is the
         # documented result on a controller-attached valve and is not an error.
         self.configuration: dict[str, Any] | None = None
+        #: `gcs-configuration/{id}/about` — serials, models and firmware per part. Read once
+        #: beside `configuration`; {} until then or if the read failed.
+        self.about_parts: dict[str, Any] = {}
+        #: The firmware reads for this valve, keyed `gcs` (the valve) and `gateway`, each
+        #: `{currentFirmware, firmware, firmwareUpdateAvailable, mandatoryUpdate, ...}`.
+        #: Refreshed twice a day — see `KohlerAnthemCoordinator.async_refresh_firmware`.
+        self.firmware_info: dict[str, dict[str, Any]] = {}
         #: The most recent `gcs-usage` response, or {} when the read failed. Refreshed on
         #: the seed only — a monthly series does not change between reconnects, and this is
         #: a diagnostic rather than something an automation waits on.
@@ -1243,7 +1300,16 @@ class Valve:
                 to_date=now.date().isoformat(),
             )
 
-        await asyncio.gather(_monthly(), self.async_refresh_daily_usage())
+        async def _about() -> None:
+            # Per-part serials and models, for the device registry and diagnostics. Answers
+            # {} on failure by contract, so it needs no guard — and it overlaps the usage
+            # reads rather than queueing behind the configuration, keeping the seed two
+            # round trips deep.
+            self.about_parts = await self.client.async_get_gcs_about(
+                self.gcs_device.device_id
+            )
+
+        await asyncio.gather(_monthly(), self.async_refresh_daily_usage(), _about())
 
     async def async_refresh_daily_usage(self) -> None:
         """Read the per-day usage series — `Interval=DAY`, verified working 2026-09-11.
@@ -1463,6 +1529,9 @@ class Valve:
             )
         else:
             ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+        # The same moments — a limit learned, the switch toggled — are the ones that can
+        # make the valve's limit match or stop matching a controller's.
+        self.coordinator.async_refresh_duration_issues()
 
     @property
     def outlet_run_times(self) -> dict[int, int]:
@@ -2311,6 +2380,44 @@ class Valve:
         except KohlerError as err:
             raise HomeAssistantError(f"Kohler command failed: {err}") from err
 
+    async def async_restart(self) -> None:
+        """Reboot the valve — the app's Restart Product. **Stops any running water.**
+
+        ``valvereset {reset: "productRestart"}``. Recorded as a local write first, so the
+        session ending under it is never mistaken for a run-time cutoff and restarted.
+        """
+        self._note_local_write()
+        self._cutoff.note_local_write(dict.fromkeys(self.model.zones, 0))
+        try:
+            await self.gcs.async_restart()
+        except DeviceOffline as err:
+            raise HomeAssistantError(
+                "The Anthem valve is offline, so it cannot receive a restart. Power-cycle "
+                "it at the breaker instead."
+            ) from err
+        except KohlerError as err:
+            raise HomeAssistantError(f"Kohler command failed: {err}") from err
+
+    async def async_control_experience(self, preset_id: int, on: bool) -> None:
+        """Start or stop a stored valve experience. **Starting one runs water.**
+
+        Same ``controlpresetorexperience {preset, action}`` body as a preset — what Konnect
+        3.0.6's current screens send for an experience id. App-confirmed; this integration
+        long held that the valve ignores it, on no recorded test.
+        """
+        self._note_local_write()
+        if not on:
+            self._cutoff.note_local_write(dict.fromkeys(self.model.zones, 0))
+        try:
+            await self.gcs.async_activate_preset(preset_id, on)
+        except DeviceOffline as err:
+            raise HomeAssistantError(
+                "The Anthem valve is offline. Check that it is powered on and connected "
+                "to Wi-Fi, then try again."
+            ) from err
+        except KohlerError as err:
+            raise HomeAssistantError(f"Kohler command failed: {err}") from err
+
     async def async_stop_shower(self) -> None:
         """Stop the water: mask byte ``0x00`` on both zones, **not** the ``0x40`` pause.
 
@@ -2463,6 +2570,10 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #: The reseed spawned on every MQTT connect. Held so `async_shutdown_stream` can
         #: cancel it — it outlives an unload otherwise, see `_handle_connected`.
         self._reseed_task: asyncio.Task | None = None
+        # The twice-daily firmware check — the one clock in an otherwise push-only design,
+        # because nothing pushes "an update is available". Cancelled on unload.
+        self._firmware_unsub: Any = None
+        self._firmware_task: asyncio.Task | None = None
         # One-shot: `async_setup` seeds, then `async_config_entry_first_refresh()` runs
         # milliseconds later and would seed the identical state all over again. See
         # `_async_update_data`.
@@ -2669,6 +2780,14 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             valve.cloud_watch.async_start()
             valve.async_refresh_setup_issue()
 
+        # FIRMWARE: once now, in the background so setup does not wait on it, then every
+        # `FIRMWARE_CHECK_INTERVAL`. Release availability is the one thing no message
+        # announces, so this is a deliberate exception to "REST on events, never a clock".
+        self._firmware_task = self.hass.async_create_task(self.async_refresh_firmware())
+        self._firmware_unsub = async_track_time_interval(
+            self.hass, self._async_firmware_tick, FIRMWARE_CHECK_INTERVAL
+        )
+
     @callback
     def _migrate_valve_settings(self, device_id: str) -> None:
         """Move the flat per-valve keys under `CONF_VALVES`, once.
@@ -2789,6 +2908,12 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._reseed_task is not None:
             self._reseed_task.cancel()
             self._reseed_task = None
+        if self._firmware_unsub is not None:
+            self._firmware_unsub()
+            self._firmware_unsub = None
+        if self._firmware_task is not None:
+            self._firmware_task.cancel()
+            self._firmware_task = None
         for valve in self.valves:
             valve.stop()
         if self.stream is not None:
@@ -2945,18 +3070,39 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # how many outlets each of this controller's zones has, which decides how its
         # state decodes the zone arrays in everything that follows. See
         # `_apply_controller_topology`.
-        if not controller.capabilities.known:
-            try:
-                config = await self.client.async_get_hub_configuration(device_id)
-                configuration = config.get("configuration") or {}
+        #
+        # The same read also carries the controller's **settings** — Max Shower Duration
+        # above all — which do change at runtime, so it is made on every seed (setup and
+        # each reconnect) and only the installation facts stay latched.
+        try:
+            config = await self.client.async_get_hub_configuration(device_id)
+            configuration = config.get("configuration") or {}
+            if not controller.capabilities.known:
                 controller.capabilities = HubCapabilities.from_configuration(
                     configuration
                 )
                 self._apply_controller_topology(controller, configuration)
+            controller.settings = HubSettings.from_configuration(configuration)
+        except KohlerError as err:
+            _LOGGER.debug("Could not read HUB configuration for %s: %s", device_id, err)
+        # The firmware's fixed experience catalogue, once. A failure leaves it empty and
+        # the Experience select offering nothing, which is the honest reading.
+        if not controller.experiences:
+            try:
+                payload = await self.client.async_get_hub_experiences(device_id)
+                controller.experiences = _experiences_by_category(payload)
             except KohlerError as err:
                 _LOGGER.debug(
-                    "Could not read HUB configuration for %s: %s", device_id, err
+                    "Could not read HUB experiences for %s: %s", device_id, err
                 )
+        # Active faults, for the Problem sensor. `{}` on failure by contract.
+        errors = await self.client.async_get_hub_active_errors(device_id)
+        details = errors.get("errorDetails")
+        controller.active_errors = [
+            entry
+            for entry in (details if isinstance(details, list) else [])
+            if isinstance(entry, dict) and str(entry.get("errorCode") or "0") != "0"
+        ]
         try:
             controller.state.apply_rest_state(
                 await self.client.async_get_hub_state(device_id)
@@ -2983,6 +3129,7 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug("No HUB favorites are saved on %s", device_id)
             else:
                 _LOGGER.debug("Could not read HUB favorites for %s: %s", device_id, err)
+        self.async_refresh_duration_issues()
 
     @callback
     def _apply_controller_topology(
@@ -3177,6 +3324,129 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise HomeAssistantError(_controller_offline(controller)) from err
         except KohlerError as err:
             raise HomeAssistantError(f"Kohler command failed: {err}") from err
+
+    async def async_set_hub_steam(self, controller: Controller, on: bool) -> None:
+        """Run or stop the controller's default steam. **On starts the steam generator.**
+
+        ``steamcontrol {steamOnOff}`` at ``steamSettings`` defaults. Refused while the
+        controller reports water running, mirroring the app ("shower and steam cannot be
+        started at the same time"). App-confirmed; never run against hardware by this
+        integration.
+        """
+        if on and controller.water_is_running:
+            raise HomeAssistantError(
+                f"{controller.name} is running the shower. The Konnect app does not allow "
+                "shower and steam at the same time — stop the shower first."
+            )
+        self._note_local_write()
+        try:
+            await controller.hub.async_set_steam(on)
+        except DeviceOffline as err:
+            raise HomeAssistantError(_controller_offline(controller)) from err
+        except KohlerError as err:
+            raise HomeAssistantError(f"Kohler command failed: {err}") from err
+
+    async def async_control_hub_experience(
+        self, controller: Controller, title: str, on: bool
+    ) -> None:
+        """Start or stop a controller experience by title. **Starting one runs water.**
+
+        The endpoint follows the category the title was listed under — a shower experience
+        sent to the steam path does nothing — so the title is resolved against the read
+        catalogue rather than trusted.
+        """
+        category = next(
+            (
+                name
+                for name, items in controller.experiences.items()
+                if any(_experience_title(item) == title for item in items)
+            ),
+            None,
+        )
+        if category is None:
+            raise HomeAssistantError(
+                f"No experience called {title!r} on {controller.name}."
+            )
+        self._note_local_write()
+        try:
+            await controller.hub.async_control_experience(title, category, on)
+        except DeviceOffline as err:
+            raise HomeAssistantError(_controller_offline(controller)) from err
+        except KohlerError as err:
+            raise HomeAssistantError(f"Kohler command failed: {err}") from err
+
+    # ------------------------------------------------------------------ #
+    # Firmware, and the duration cross-check
+    # ------------------------------------------------------------------ #
+    async def _async_firmware_tick(self, _now: Any) -> None:
+        await self.async_refresh_firmware()
+
+    async def async_refresh_firmware(self) -> None:
+        """Read installed-vs-latest firmware for every valve, gateway and controller.
+
+        Read-only — installing stays with the app, which refuses while water runs or the
+        device is `Disconnected`. Each read answers `{}` on failure by contract, so one
+        unreachable part leaves only its own update entity unknown.
+        """
+        for valve in self.valves:
+            device_id = valve.device_id
+            gcs, gateway = await asyncio.gather(
+                self.client.async_get_firmware(device_id, "gcs"),
+                self.client.async_get_firmware(device_id, "gateway"),
+            )
+            valve.firmware_info = {"gcs": gcs, "gateway": gateway}
+        for controller in self.controllers:
+            controller.firmware_info = await self.client.async_get_firmware(
+                controller.device_id, "hub"
+            )
+        self.async_refresh_entities()
+
+    @callback
+    def async_refresh_duration_issues(self) -> None:
+        """Raise or clear "the two Max Shower Durations differ", per controller.
+
+        The rule `runtime_cutoff` depends on is *match the durations*: with them equal the
+        valve's restorable ``0x40`` pause always lands first; with the controller's longer,
+        its ``0x00`` can end a shower Endless Shower is keeping alive. Until 2026-10-07 the
+        controller's number was thought unreadable, so this could not be checked.
+
+        Raised only on evidence: Endless Shower on for a valve, that valve's limits known,
+        the controller's duration read, and the two different. Which controller fronts which
+        valve is not knowable from the cloud, so every pairing is compared — on the usual
+        account there is one of each.
+        """
+        if self.hass is None:
+            return
+        for controller in self.controllers:
+            issue_id = f"{ISSUE_DURATION_MISMATCH}_{controller.device_id}"
+            minutes = controller.settings.max_shower_duration_minutes
+            mismatch = None
+            if minutes:
+                for valve in self.valves:
+                    if not valve.restart_on_runtime_cutoff:
+                        continue
+                    limits = set(valve.outlet_run_times.values())
+                    if limits and limits != {minutes * 60}:
+                        mismatch = (valve, max(limits))
+                        break
+            if mismatch is None:
+                ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+                continue
+            valve, seconds = mismatch
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                issue_id,
+                is_fixable=False,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key=ISSUE_DURATION_MISMATCH,
+                translation_placeholders={
+                    "controller": controller.name,
+                    "controller_minutes": str(minutes),
+                    "valve": valve.name,
+                    "valve_minutes": str(round(seconds / 60)),
+                },
+            )
 
     async def async_stop_hub(self, controller: Controller) -> None:
         """Stop everything the controller is running — water, steam, music, lighting.

@@ -3,7 +3,9 @@
 The HUB is favorite-centric. There is **no direct "set outlet/temperature/flow now"**
 command: to run a specific configuration you create or edit a *favorite* and activate it.
 The only direct commands are bare on/off for the controller's own stored default
-(``valvecontrol`` / ``steamcontrol``) and ``stopall``.
+(``valvecontrol`` / ``steamcontrol``) and ``stopall``. Konnect 3.0.6 confirms it: nine HUB
+command paths plus ``hub/factoryreset``, and no light, music, volume or temperature command
+anywhere in the app.
 
 Two constraints shape every caller:
 
@@ -119,6 +121,138 @@ def zone_number(attribute: dict[str, Any]) -> int | None:
 
 CONNECTED = "Connected"
 
+#: What `about.valveN.serialNumber` reads for a valve body that is not fitted.
+_NO_SERIAL = "0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0"
+
+
+def _connected(value: Any) -> bool:
+    """`parts.X == "Connected"`, case-insensitively — the app's own comparison."""
+    return str(value or "").strip().lower() == CONNECTED.lower()
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(float(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class HubSettings:
+    """The controller's own settings, as ``hub-configuration`` publishes them.
+
+    **Max Shower Duration is here.** This integration long held that the controller's
+    duration was readable only through the local API, and so could not warn when it
+    disagreed with the valve's (``runtime_cutoff``). Konnect 3.0.6 reads it from
+    ``configuration.systemSettings.maxShowerDuration`` — minutes — as the default and cap
+    for a favorite's duration. Whether the cloud copy follows an edit made on the
+    controller's web page promptly is unverified: REST has been seen to lag on
+    ``amplifierSettings.monoVolume``.
+
+    ``disconnected`` applies the app's own rules (``nc0/z.java`` ``k()``): an accessory
+    counts as fitted from configuration evidence — a valve body whose ``about`` serial is
+    not all zeros, a steam generator with a non-zero ``defaultTime``, an amplifier with a
+    volume, any configured light group — and is reported when fitted but its ``parts``
+    entry is not ``Connected``. That is the case ``HubCapabilities`` cannot see: it gates
+    entities on ``parts`` alone, so a fitted accessory that drops off simply vanishes.
+    """
+
+    max_shower_duration_minutes: int | None = None
+    shower_max_temperature: int | None = None
+    temperature_unit: str | None = None
+    flow_rate_enabled: bool | None = None
+    steam_default_temperature: int | None = None
+    steam_default_time: int | None = None
+    steam_max_temperature: int | None = None
+    light_groups: tuple[str, ...] = ()
+    lan_ip: str | None = None
+    disconnected: tuple[str, ...] = ()
+
+    @classmethod
+    def from_configuration(cls, configuration: dict[str, Any]) -> HubSettings:
+        """Read the settings from a ``hub-configuration`` ``configuration`` block."""
+        configuration = configuration if isinstance(configuration, dict) else {}
+
+        def block(name: str) -> dict[str, Any]:
+            value = configuration.get(name)
+            return value if isinstance(value, dict) else {}
+
+        system = block("systemSettings")
+        steam = block("steamSettings")
+        amplifier = block("amplifierSettings")
+        parts = block("parts")
+        about = block("about")
+        lights = configuration.get("lightSettings")
+        lights = (
+            [x for x in lights if isinstance(x, dict)]
+            if isinstance(lights, list)
+            else []
+        )
+
+        def serial(name: str) -> str | None:
+            entry = about.get(name)
+            if not isinstance(entry, dict):
+                return None
+            value = entry.get("serialNumber")
+            return None if value in (None, "") else str(value)
+
+        disconnected: list[str] = []
+        for name in ("valve1", "valve2"):
+            number = serial(name)
+            if (
+                number is not None
+                and number != _NO_SERIAL
+                and not _connected(parts.get(name))
+            ):
+                disconnected.append(name)
+        steam_time = _int_or_none(steam.get("defaultTime"))
+        if steam_time and not _connected(parts.get("steam")):
+            disconnected.append("steam")
+        amplifier_fitted = (
+            amplifier.get("stereoVolume") is not None
+            or amplifier.get("monoVolume") is not None
+        )
+        if amplifier_fitted and not _connected(parts.get("amplifier")):
+            disconnected.append("amplifier")
+        if lights and (
+            not _connected(parts.get("light"))
+            or any(str(x.get("connectivity")) == "No" for x in lights)
+        ):
+            disconnected.append("light")
+        if amplifier_fitted:
+            sd_card = str(amplifier.get("sdCard") or "").strip().lower()
+            music = str(amplifier.get("music") or "").strip().lower()
+            if sd_card == "notpresent":
+                disconnected.append("sd_card")
+            elif music in {"notpresent", "unknown"}:
+                disconnected.append("sd_card_empty")
+
+        flow = system.get("flowRateEnable")
+        hub = about.get("hub")
+        wlan = hub.get("wlan") if isinstance(hub, dict) else None
+        ip = wlan.get("ip") if isinstance(wlan, dict) else None
+        return cls(
+            max_shower_duration_minutes=_int_or_none(system.get("maxShowerDuration")),
+            shower_max_temperature=_int_or_none(system.get("showerMaxTemperature")),
+            temperature_unit=(
+                str(system["temperatureUnit"])
+                if system.get("temperatureUnit")
+                else None
+            ),
+            flow_rate_enabled=None if flow is None else str(flow).strip() == "1",
+            steam_default_temperature=_int_or_none(steam.get("defaultTemperature")),
+            steam_default_time=steam_time,
+            steam_max_temperature=_int_or_none(steam.get("maxTemperature")),
+            light_groups=tuple(str(x.get("name")) for x in lights if x.get("name")),
+            lan_ip=str(ip) if ip else None,
+            disconnected=tuple(disconnected),
+        )
+
+    @property
+    def steam_ready(self) -> bool:
+        """Whether the app would offer its "Steam start" card: a non-zero default time."""
+        return bool(self.steam_default_time)
+
 
 @dataclass(frozen=True)
 class HubCapabilities:
@@ -185,10 +319,18 @@ class HubDevice:
     ) -> None:
         self._client = client
         self.device_id = device_id
-        # Unlike the GCS valve byte, HUB favorite temperatures are integers in the
-        # ACCOUNT's unit — the app sends °F as-is and only converts when the account is
-        # set to Celsius. So no conversion happens here.
+        # Favorite temperatures are **whole °F on the wire, whatever the account's unit.**
+        # Konnect 3.0.6 converts a Celsius account's entry to °F before it goes into the
+        # request (`nc0/z.java` `G0()` -> `F()`, `round(c * 1.8 + 32)`, at every zone and
+        # steam setter) and back to °C only for display. This said the opposite until
+        # 2026-10-07 — harmless only because nothing called the favorite writers yet.
         self.temperature_unit = temperature_unit
+
+    def to_wire_temperature(self, temperature: float) -> int:
+        """A temperature in the account's unit -> the whole °F a favorite carries."""
+        if str(self.temperature_unit).strip().lower().startswith("c"):
+            return 0 if int(temperature) == 0 else round(temperature * 1.8 + 32)
+        return round(temperature)
 
     def _base(self) -> dict[str, Any]:
         return {
@@ -209,7 +351,13 @@ class HubDevice:
         )
 
     async def async_set_steam(self, on: bool) -> Any:
-        """Run or stop the controller's default steam configuration."""
+        """Run or stop the controller's default steam configuration.
+
+        Runs at ``steamSettings.defaultTemperature`` for ``defaultTime`` — the body carries
+        nothing else. The app refuses to start steam while the shower runs, and the
+        controller refuses a favorite holding both; ``KohlerAnthemCoordinator`` mirrors the
+        first guard.
+        """
         return await self._client.async_request(
             "POST",
             HUB_STEAM_CONTROL,
@@ -251,14 +399,12 @@ class HubDevice:
         music: dict[str, Any] | None = None,
         light: list[dict[str, Any]] | None = None,
     ) -> Any:
-        """Create a favorite. Omit ``id`` — that is what makes it a create."""
-        return await self._client.async_request(
-            "POST",
-            HUB_FAVORITE,
-            json_body=self._favorite_body(
-                name, zone1=zone1, zone2=zone2, steam=steam, music=music, light=light
-            ),
+        """Create a favorite. ``id: 0`` is what makes it a create, as the app sends it."""
+        body = self._favorite_body(
+            name, zone1=zone1, zone2=zone2, steam=steam, music=music, light=light
         )
+        body["id"] = 0
+        return await self._client.async_request("POST", HUB_FAVORITE, json_body=body)
 
     async def async_edit_favorite(
         self,
@@ -299,21 +445,38 @@ class HubDevice:
         music: dict[str, Any] | None,
         light: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
-        """Assemble a favorite body.
+        """Assemble a favorite body the way Konnect 3.0.6 does.
 
-        ``music`` is omitted entirely when unset: sending an all-null music object makes
-        the whole request fail with HTTP 400, whereas leaving the key out is accepted.
+        **Components are omitted, not nulled.** The app serialises with Gson defaults, so
+        an unset component never reaches the wire: ``water`` only when a zone has outlets,
+        ``steam`` only when steam is on, ``music`` only with an amplifier source, ``light``
+        only for active groups, and ``zone2`` only when used. (``music`` was already known
+        to fail with HTTP 400 when sent all-null.) Until 2026-10-07 this sent ``zone2: null``,
+        ``steam: {0, 0}`` and ``light: []``; app-side only, untested live either way.
+
+        🚨 **A favorite may not hold both water and steam** — the app refuses to build one
+        ("A favorite cannot contain both Shower and Steam"), so this refuses too rather
+        than find out what the controller does with it.
         """
-        body: dict[str, Any] = {
-            **self._base(),
-            "name": name,
-            # The app sends null for an unused zone; a zone with outlets: [] also works.
-            "water": {"zone1": zone1, "zone2": zone2},
-            "steam": steam or {"temperature": 0, "time": 0},
-            "light": light if light is not None else [],
+        water = {
+            key: value
+            for key, value in (("zone1", zone1), ("zone2", zone2))
+            if value is not None
         }
+        if water and steam:
+            raise ValueError(
+                "A favorite cannot contain both shower and steam — the Konnect app forbids "
+                "it, and what the controller would do with one is untested."
+            )
+        body: dict[str, Any] = {**self._base(), "name": name}
+        if water:
+            body["water"] = water
+        if steam:
+            body["steam"] = steam
         if music is not None:
             body["music"] = music
+        if light:
+            body["light"] = light
         return body
 
     @staticmethod
@@ -322,8 +485,11 @@ class HubDevice:
     ) -> dict[str, Any]:
         """Build a water zone for a favorite body.
 
-        ``temperature`` is an integer in the account's unit. ``outlets`` are per-outlet
-        flags, converted here to the 0-based position list the API expects.
+        ``temperature`` is **whole °F** — convert an account-unit value with
+        :meth:`to_wire_temperature` first. The app bounds it 59 °F to the controller's
+        ``showerMaxTemperature``, and ``flowrate`` 10-100 (only editable when
+        ``flowRateEnable`` is ``"1"``). ``outlets`` are per-outlet flags, converted here to
+        the 0-based position list the API expects.
         """
         return {
             "temperature": int(temperature),
@@ -344,8 +510,8 @@ class HubDevice:
         splits them across zone1/zone2 the way the model dictates and converts each zone's
         flags to the 0-based position list a write expects.
 
-        A zone the model does not have is sent as ``null``, which is what the app sends
-        for an unused zone.
+        A zone the model does not have comes back as ``None``, which
+        :meth:`_favorite_body` leaves out of the body, as the app does.
         """
         zone1_flags, zone2_flags = model.split_outlets(outlets)
         zones: dict[str, dict[str, Any] | None] = {
@@ -387,8 +553,10 @@ class HubDevice:
         ``title`` is the experience's TITLE string, not its numeric id.
 
         Experiences carry no outlet or curve data in the API — the program is internal to
-        the firmware and always runs on the default zone1/outlet1. Use a favorite when
-        you need a specific outlet.
+        the firmware and always runs on the default zone1/outlet1 (the app says so: "will
+        run from the fitting connected to the first port of zone 1"). Use a favorite when
+        you need a specific outlet. Run state comes back as ``SHOWER_EXP_STS`` /
+        ``STEAM_EXP_STS`` / ``ICE_SHOWER_EXP_STS``.
         """
         endpoint = EXPERIENCE_ENDPOINTS.get(category)
         if endpoint is None:

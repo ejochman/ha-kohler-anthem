@@ -20,10 +20,13 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .const import (
+    HUB_STEAM_POWERCLEAN,
+    MSG_GCS_DISPENSED_VOLUME,
     MSG_GCS_OUTLET_CONFIG,
     MSG_GCS_PRESET_STATUS,
     MSG_GCS_SOLO_STATUS,
     MSG_GCS_WARMUP_STATUS,
+    MSG_HUB_EXPERIENCE_CODES,
     MSG_HUB_FAVORITE,
     MSG_HUB_FAVORITES_SNAPSHOT,
     MSG_HUB_LIGHT,
@@ -32,6 +35,8 @@ from .const import (
     MSG_HUB_STEAM,
     SKU_GCS,
     SKU_HUB,
+    SYSTEM_STATE_ERROR,
+    SYSTEM_STATE_FIRMWARE,
     WARMUP_IN_PROGRESS,
 )
 from .hub import outlet_flags, zone_number
@@ -87,6 +92,12 @@ def _preset_id_or_none(value: object) -> int | None:
     except (TypeError, ValueError):
         return None
     return number or None
+
+
+def _text(item: dict[str, Any], key: str) -> str | None:
+    """A field echoed back verbatim on a write: its string form, or None when absent."""
+    value = item.get(key)
+    return None if value is None else str(value)
 
 
 def outlet_limits_from_settings(payload: Any) -> dict[int, OutletLimits]:
@@ -179,6 +190,8 @@ def outlet_limits_from_settings(payload: Any) -> dict[int, OutletLimits]:
                 _tenths("minimumOutletTemperature"),
                 _tenths("defaultOutletTemperature"),
                 outlet_flags,
+                _text(entry, "maxVolume"),
+                _text(entry, "purge"),
             )
     return limits
 
@@ -223,11 +236,9 @@ class OutletLimits:
     # `docs/architecture.md` documents the two devices holding *different* codes for the
     # same physical fixture on purpose (id 4 is 39 to the valve, 38 to the controller).
     #
-    # Deliberately **not** translated to a name here. Only three codes are documented
-    # (1=handshower, 11=showerhead, 21=tub filler) and `docs/hub/cloud_api.md` says the
-    # others are install-specific, so a lookup table would be inventing names for codes
-    # nobody has confirmed. The raw code is published instead, and a map can follow once
-    # real installs have been compared against what the Konnect app shows.
+    # Deliberately **not** translated to a name here — that is presentation, and lives in
+    # the Home Assistant layer as `OUTLET_TYPE_NAMES`. The full table of nineteen codes is
+    # Konnect 3.0.6's own outlet picker (`docs/protocol/gcs_valve.md` §Outlet types).
     #
     # None when the valve has not announced this outlet yet — the same "not learned"
     # meaning the run time carries, never a real type.
@@ -247,8 +258,8 @@ class OutletLimits:
     #
     # None when the valve has not reported it, which is not the same as no limit.
     maximum_temperature_tenths: int | None = None
-    # The remaining three fields of `writeoutletconfig`'s eleven, captured 2026-09-11 so a
-    # write can replace the record without inventing them.
+    # Three more fields of `writeoutletconfig`'s twelve, captured 2026-09-11 so a write can
+    # replace the record without inventing them.
     #
     # 🚨 **`writeoutletconfig` is a whole-record replace.** Omitting a key, or sending a
     # guess, changes the setting it names — and one of these sits beside the scald limit.
@@ -262,8 +273,15 @@ class OutletLimits:
     default_temperature_tenths: int | None = None
     # `outLetFlags`. Meaning undocumented and deliberately not interpreted: it is read so a
     # write can echo it back unchanged, which is the only thing this integration needs from
-    # it. `1` on every outlet of every install seen so far.
+    # it. `1` on every outlet of every install seen so far. Konnect 3.0.6 treats it exactly
+    # the same way — echoes it, defaults it to `"1"` for a new outlet, never reads it.
     outlet_flags: int | None = None
+    # The last two of the twelve, kept as the **strings** they arrive as because they are
+    # only ever echoed. Konnect always sends them; no captured read has carried either, so
+    # these are None on every known install and a write sends the app's own values instead
+    # (`maxVolume` "0", `purge` ""). See `GcsDevice.async_write_outlet_config`.
+    max_volume: str | None = None
+    purge: str | None = None
 
 
 @dataclass(frozen=True)
@@ -287,8 +305,9 @@ class GcsPreset:
     def is_selectable(self) -> bool:
         """Whether this can be offered to a user as a scene to run.
 
-        Experiences are excluded: they carry no valve data and cannot be started the same
-        way, despite sharing the id space via ``presetOrExperienceId``.
+        Experiences are excluded: they carry no valve data and are offered separately (the
+        valve's Experience select), despite sharing the id space via
+        ``presetOrExperienceId`` and starting with the same command.
         """
         return not self.is_empty and not self.is_experience
 
@@ -357,11 +376,20 @@ class GcsState:
     # Water figures come from `gcs-usage` instead — Kohler's own per-month series, in litres,
     # the same data the app charts. See `ValveMonthlyWaterSensor`, `ValveYearlyWaterSensor`.
     total_flow: float | None = None
-    # `currentSystemState` — `normalOperation` or `showerInProgress`, as the valve itself
-    # reports it. Kept as the device's own string rather than folded into the four-state
-    # `Status` vocabulary, because it is a second, independent opinion: it is the valve's
-    # own session flag, not a decode of the command word, and the two can disagree.
+    # `currentSystemState` — `normalOperation` or `showerInProgress` in every capture, as the
+    # valve itself reports it. Kept as the device's own string rather than folded into the
+    # four-state `Status` vocabulary, because it is a second, independent opinion: it is the
+    # valve's own session flag, not a decode of the command word, and the two can disagree.
+    #
+    # Konnect 3.0.6 acts on two more: `error` is a valve fault (see `has_fault`) and
+    # `FirmwareUpdate` an install in progress (see `firmware_updating`). Neither has been
+    # captured.
     system_state: str | None = None
+    # `READ_DISPENSED_WATER_VOLUME_STS` `attributes[0].volume`, raw. A running counter the
+    # app's bath-fill setup samples before and after a fill — arrives only when something
+    # asks (`/commands/gcs/bathfillervolume`), so on this integration it stays None unless the
+    # app is mid-setup. Recorded for diagnostics; units unstated by the app.
+    dispensed_volume: str | None = None
     last_update: float | None = None
 
     # Stored presets, keyed by slot id. Ids are **slots, not positions**: creating fills the
@@ -501,12 +529,32 @@ class GcsState:
         reasoning, including why this was withheld previously.
 
         See also :attr:`error_codes` — byte 7 reads a constant ``1`` on the tested unit, so
-        a nonzero code is not a fault. This flag is the only fault signal.
+        a nonzero code is not a fault.
+
+        **Two signals, matching Konnect 3.0.6's own rule** (``mc0/n.java``): the error flag on
+        either word, *or* ``currentSystemState == "error"`` (case-insensitive). Until
+        2026-10-07 only the flag was read.
         """
+        if self.system_state is not None and (
+            self.system_state.strip().lower() == SYSTEM_STATE_ERROR
+        ):
+            return True
         words = [w for w in (self.valve1, self.valve2) if w is not None]
         if not words:
             return None
         return any(w.error_flag for w in words)
+
+    @property
+    def firmware_updating(self) -> bool:
+        """Whether the valve reports a firmware install in progress.
+
+        ``currentSystemState == "FirmwareUpdate"`` — the state on which Konnect 3.0.6 sends
+        the user away from the controls. Never captured; read so an update entity can show
+        it and so a running install is not reported as an unknown state.
+        """
+        return (self.system_state or "").strip().lower() == (
+            SYSTEM_STATE_FIRMWARE.lower()
+        )
 
     @property
     def error_codes(self) -> dict[str, int]:
@@ -611,6 +659,7 @@ class GcsState:
             MSG_GCS_WARMUP_STATUS: self._apply_warmup,
             MSG_GCS_PRESET_STATUS: self._apply_preset,
             MSG_GCS_OUTLET_CONFIG: self._apply_outlet_config,
+            MSG_GCS_DISPENSED_VOLUME: self._apply_dispensed_volume,
         }.get(envelope.code)
         if handler is not None:
             handler(envelope)
@@ -685,12 +734,14 @@ class GcsState:
                 _int("minimumOutletTemperature"),
                 _int("defaultOutletTemperature"),
                 _int("outLetFlags"),
+                _text(attribute, "maxVolume"),
+                _text(attribute, "purge"),
             )
             # **Merge, do not replace.** A field this message did not carry must keep the
             # value already learned: `None` means "not learned", and a write refuses on it,
             # so blanking one here turns a thin announcement into the same
             # one-write-then-never-again failure the three missing fields caused. Every
-            # capture carries all ten, and the parser must not depend on that.
+            # capture carries the ten, and the parser must not depend on that.
             known = self.outlet_limits.get(outlet_id)
             if known is not None:
                 limits = replace(
@@ -705,6 +756,8 @@ class GcsState:
                             "minimum_temperature_tenths",
                             "default_temperature_tenths",
                             "outlet_flags",
+                            "max_volume",
+                            "purge",
                         )
                         if getattr(limits, field) is None
                     },
@@ -713,6 +766,16 @@ class GcsState:
                 self.outlet_limits[outlet_id] = limits
                 changed = True
         return changed
+
+    def _apply_dispensed_volume(self, envelope: Envelope) -> bool:
+        """Record the bath-fill volume counter, raw. Diagnostic only."""
+        for attribute in envelope.attributes:
+            if isinstance(attribute, dict) and attribute.get("volume") is not None:
+                volume = str(attribute.get("volume"))
+                changed = volume != self.dispensed_volume
+                self.dispensed_volume = volume
+                return changed
+        return False
 
     def zone_flow_limits(self, zone: int) -> tuple[int, int]:
         """Flow bounds for a zone as **byte** values, falling back to the constants.
@@ -928,6 +991,22 @@ class GcsState:
             if preset.is_selectable and preset.preset_id not in hidden
         ]
 
+    def experiences(self) -> list[GcsPreset]:
+        """Stored experiences, lowest slot first. Started like presets; see ``GcsDevice``."""
+        return [
+            preset
+            for _, preset in sorted(self.presets.items())
+            if preset.is_experience and not preset.is_empty
+        ]
+
+    def experience_by_name(self, name: str) -> GcsPreset | None:
+        """Resolve an experience by name, case-insensitively, at call time."""
+        wanted = name.strip().lower()
+        for preset in self.experiences():
+            if preset.name.strip().lower() == wanted:
+                return preset
+        return None
+
     def preset_by_name(
         self, name: str, hidden: Container[int] = ()
     ) -> GcsPreset | None:
@@ -945,6 +1024,21 @@ class GcsState:
             if preset.name.strip().lower() == wanted:
                 return preset
         return None
+
+
+def _light_key(attribute: dict[str, Any]) -> str:
+    """One light group's key, the same whichever surface named it.
+
+    MQTT names a group by ``component`` (``lightgroupA``) and REST by ``name`` (``groupA``,
+    or a display name). Both reduce to the bare letter, so a REST seed and a later push for
+    the same group land on one entry instead of two that disagree.
+    """
+    raw = str(attribute.get("component") or attribute.get("name") or "light")
+    text = raw.strip().lower().replace(" ", "").replace("_", "")
+    for prefix in ("lightgroup", "group", "light"):
+        if text.startswith(prefix) and len(text) > len(prefix):
+            return text[len(prefix) :]
+    return text
 
 
 @dataclass
@@ -972,7 +1066,27 @@ class HubState:
     zones: dict[int, HubZone] = field(default_factory=dict)
     music_on: bool | None = None
     steam_on: bool | None = None
-    light_on: bool | None = None
+    # `STEAM_STS` `status` as sent — `ON`, `OFF`, or `POWERCLEAN` while the generator cleans
+    # itself. `steam_on` stays a strict on/off; this keeps the third state visible.
+    steam_status: str | None = None
+    # Steam detail from `STEAM_STS` / `hub-state.hubSteamState`. Strings as sent: the
+    # temperature is in °F on every surface the app reads, and the times are as the
+    # controller formats them. None until reported.
+    steam_temperature: str | None = None
+    steam_start_time: str | None = None
+    steam_total_time: str | None = None
+    # Per light group, keyed by `_light_key` (`a`, `b`, `c`). `LIGHT_STS` arrives one group
+    # per message, so the single `light_on` this used to keep was whichever group reported
+    # last: "group A on" followed by "group B off" read as off. `light_on` is now derived.
+    lights: dict[str, bool] = field(default_factory=dict)
+    # The running controller experience's title, from `SHOWER_EXP_STS` / `STEAM_EXP_STS` /
+    # `ICE_SHOWER_EXP_STS`; None when none is running.
+    active_experience: str | None = None
+    # Fault flags. `error_components` merges `hub-state.errorComponent` (amplifier, hub,
+    # light, steam, valve1, valve2) with the per-message `errorstate` the accessory messages
+    # carry; `error` is the controller's own top-level `errorState`.
+    error: bool | None = None
+    error_components: dict[str, bool] = field(default_factory=dict)
     active_favorite_id: str | None = None
     # The running favorite's name, as `FAVORITE_STS` reports it. Kept beside the id because
     # the message carries both, and the name is usable before the favorites list has been
@@ -1006,6 +1120,43 @@ class HubState:
     def is_running(self) -> bool:
         return any(z.status == "ON" for z in self.zones.values())
 
+    @property
+    def light_on(self) -> bool | None:
+        """Whether **any** light group is on; None until one has reported."""
+        if not self.lights:
+            return None
+        return any(self.lights.values())
+
+    @property
+    def steam_powerclean(self) -> bool:
+        """Whether the steam generator is running its self-clean (`POWERCLEAN`)."""
+        return (self.steam_status or "").upper() == HUB_STEAM_POWERCLEAN
+
+    @property
+    def has_fault(self) -> bool | None:
+        """Whether the controller or any component reports a fault; None until read."""
+        if self.error is None and not self.error_components:
+            return None
+        return bool(self.error) or any(self.error_components.values())
+
+    def _note_errorstate(self, envelope: Envelope, component: str) -> None:
+        """Record an accessory message's `errorstate` ("1" = fault) under ``component``.
+
+        For the shower valve the component is per zone — `valve1` / `valve2` — matching the
+        `errorComponent` keys REST uses, so the two sources share one map.
+        """
+        for attribute in envelope.attributes:
+            if not isinstance(attribute, dict):
+                continue
+            flag = _flag(attribute.get("errorstate"))
+            if flag is None:
+                continue
+            key = component
+            if component == "valve":
+                number = zone_number(attribute)
+                key = f"valve{number}" if number is not None else "valve1"
+            self.error_components[key] = flag
+
     def apply_envelope(self, envelope: Envelope) -> bool:
         """Apply a HUB message. True for every HUB message, False for anything else.
 
@@ -1028,12 +1179,15 @@ class HubState:
             MSG_HUB_FAVORITE: self._apply_favorite,
             MSG_HUB_FAVORITES_SNAPSHOT: self._apply_favorites_snapshot,
         }.get(envelope.code)
+        if handler is None and envelope.code in MSG_HUB_EXPERIENCE_CODES:
+            handler = self._apply_experience
         if handler is not None:
             handler(envelope)
         return True
 
     def _apply_valve(self, envelope: Envelope) -> bool:
         changed = False
+        self._note_errorstate(envelope, "valve")
         # `showerwarmup` sits beside `attributes` under `data`, not within it. Note the
         # casing: MQTT sends `showerwarmup`, the REST read sends `showerWarmUp`.
         data = envelope.raw.get("data")
@@ -1096,8 +1250,10 @@ class HubState:
         return None
 
     def _apply_music(self, envelope: Envelope) -> bool:
-        # Music telemetry is on/off only. Source, volume, and track are not reported on
-        # either channel unless a favorite is driving it.
+        # Music telemetry is on/off only — confirmed by Konnect 3.0.6, whose `MUSIC_STS`
+        # model carries nothing beyond status and the error pair. Source, volume, and track
+        # are not reported on either channel unless a favorite is driving it.
+        self._note_errorstate(envelope, "amplifier")
         value = self._status_flag(envelope, "amplifier")
         changed = value is not None and value != self.music_on
         if value is not None:
@@ -1105,18 +1261,75 @@ class HubState:
         return changed
 
     def _apply_steam(self, envelope: Envelope) -> bool:
+        """`STEAM_STS` — status, plus the temperature and timer the app's model carries.
+
+        ``POWERCLEAN`` is neither ON nor OFF, so ``_status_flag`` drops it and `steam_on`
+        keeps its last value; `steam_status` records it so the state is not lost.
+        """
+        self._note_errorstate(envelope, "steam")
+        before = (
+            self.steam_on,
+            self.steam_status,
+            self.steam_temperature,
+            self.steam_start_time,
+            self.steam_total_time,
+        )
         value = self._status_flag(envelope)
-        changed = value is not None and value != self.steam_on
         if value is not None:
             self.steam_on = value
-        return changed
+        for attribute in envelope.attributes:
+            if not isinstance(attribute, dict):
+                continue
+            if (status := attribute.get("status")) is not None:
+                self.steam_status = str(status).upper()
+                if self.steam_powerclean:
+                    # The generator is busy, not steaming for anyone.
+                    self.steam_on = False
+            for key, name in (
+                ("temperature", "steam_temperature"),
+                ("starttime", "steam_start_time"),
+                ("totaltime", "steam_total_time"),
+            ):
+                if attribute.get(key) not in (None, ""):
+                    setattr(self, name, str(attribute.get(key)))
+            break
+        return before != (
+            self.steam_on,
+            self.steam_status,
+            self.steam_temperature,
+            self.steam_start_time,
+            self.steam_total_time,
+        )
 
     def _apply_light(self, envelope: Envelope) -> bool:
-        value = self._status_flag(envelope)
-        changed = value is not None and value != self.light_on
-        if value is not None:
-            self.light_on = value
-        return changed
+        """`LIGHT_STS` — one group per message, so record it per group."""
+        self._note_errorstate(envelope, "light")
+        before = dict(self.lights)
+        for attribute in envelope.attributes:
+            if not isinstance(attribute, dict):
+                continue
+            status = str(attribute.get("status") or "").upper()
+            if status in {"ON", "OFF"}:
+                self.lights[_light_key(attribute)] = status == "ON"
+        return before != self.lights
+
+    def _apply_experience(self, envelope: Envelope) -> bool:
+        """`*_EXP_STS` — `{code, name, ready, status}`: which experience, if any, is running.
+
+        An `OFF` clears only the experience it names, so a late stop for one program cannot
+        wipe out the start of the next.
+        """
+        before = self.active_experience
+        for attribute in envelope.attributes:
+            if not isinstance(attribute, dict):
+                continue
+            name = str(attribute.get("name") or "").strip() or None
+            status = str(attribute.get("status") or "").strip().upper()
+            if status == "ON" and name is not None:
+                self.active_experience = name
+            elif status == "OFF" and (name is None or name == self.active_experience):
+                self.active_experience = None
+        return before != self.active_experience
 
     def _apply_favorite(self, envelope: Envelope) -> bool:
         """Track which favorite is running, from `FAVORITE_STS`.
@@ -1241,14 +1454,34 @@ class HubState:
         steam_state = state.get("hubSteamState")
         steam = steam_state.get("status") if isinstance(steam_state, dict) else None
         if steam is not None:
-            self.steam_on = str(steam).upper() == "ON"
+            self.steam_status = str(steam).upper()
+            self.steam_on = self.steam_status == "ON"
+        if isinstance(steam_state, dict):
+            for key, name in (
+                ("temperature", "steam_temperature"),
+                ("startTime", "steam_start_time"),
+                ("totalTime", "steam_total_time"),
+            ):
+                if steam_state.get(key) not in (None, ""):
+                    setattr(self, name, str(steam_state.get(key)))
         lights = state.get("light")
         if isinstance(lights, list):
-            self.light_on = any(
-                str(light.get("status", "")).upper() == "ON"
-                for light in lights
-                if isinstance(light, dict)
-            )
+            for light in lights:
+                if not isinstance(light, dict):
+                    continue
+                status = str(light.get("status") or "").upper()
+                if status in {"ON", "OFF"}:
+                    self.lights[_light_key(light)] = status == "ON"
+        # Fault flags sit at the top level, beside `state` (`AnthemHubStateModel`).
+        error = _flag(payload.get("errorState"))
+        if error is not None:
+            self.error = error
+        components = payload.get("errorComponent")
+        if isinstance(components, dict):
+            for key in ("amplifier", "hub", "light", "steam", "valve1", "valve2"):
+                flag = _flag(components.get(key))
+                if flag is not None:
+                    self.error_components[key] = flag
         # Top level, beside `state` rather than inside it — and camelCase here, against the
         # all-lowercase `showerwarmup` MQTT sends for the same thing.
         warmup = _flag(payload.get("showerWarmUp"))

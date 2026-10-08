@@ -1,4 +1,4 @@
-"""Favorite selection for the Anthem valve.
+"""Favorite and experience selection for the Anthem valve and the Anthem Plus controller.
 
 One dropdown that both **starts** a stored scene and **shows which one is running**, because
 the valve reports the active scene itself (``presetOrExperienceId``) rather than leaving Home
@@ -151,6 +151,7 @@ async def async_setup_entry(
     entities: list[SelectEntity] = []
     for valve in coordinator.valves:
         entities.append(FavoriteSelect(coordinator, valve))
+        entities.append(ValveExperienceSelect(coordinator, valve))
         entities.append(ValveWarmupSelect(coordinator, valve))
         entities.append(OutletRunTimeSelect(coordinator, valve))
     # Each controller keeps its own favorites on a different command surface from the
@@ -159,6 +160,7 @@ async def async_setup_entry(
     # its own dropdown rather than a longer one.
     for controller in coordinator.controllers:
         entities.append(HubFavoriteSelect(coordinator, controller))
+        entities.append(HubExperienceSelect(coordinator, controller))
     async_add_entities(entities)
 
 
@@ -220,20 +222,18 @@ class FavoriteSelect(OptimisticOptionMixin, KohlerValveEntity, SelectEntity):
 
     @property
     def _experiences(self) -> list[str]:
-        """Names of the stored experiences, which cannot be offered as options.
+        """Names of the stored experiences, which this dropdown leaves to its sibling.
 
-        Experiences share the id space with favorites via ``presetOrExperienceId`` but
-        carry no valve settings, so activating one does nothing — the shower ignores the
-        command. They are therefore kept out of `options`, and named here instead.
+        Experiences share the id space with favorites via ``presetOrExperienceId`` and start
+        with the same command, but they are firmware programs rather than scenes the owner
+        built, and the app lists them separately — so does this integration, on the
+        **Experience** select. Named here so an automation that asks this entity for one gets
+        pointed at the right place.
         """
         state = self._state
         if state is None:
             return []
-        return sorted(
-            preset.name
-            for preset in state.presets.values()
-            if preset.is_experience and not preset.is_empty
-        )
+        return sorted(preset.name for preset in state.experiences())
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -253,9 +253,7 @@ class FavoriteSelect(OptimisticOptionMixin, KohlerValveEntity, SelectEntity):
         if experiences:
             attributes["experiences"] = experiences
             attributes["experiences_note"] = (
-                "Experiences are stored on the valve but carry no valve settings, so "
-                "they cannot be started from Home Assistant — the shower ignores the "
-                "command. Start them from the Konnect app or the touchscreen."
+                "Experiences are started from this valve's Experience select."
             )
         # **Why the dropdown is empty, when it is.** An `Off`-only picker is
         # indistinguishable from one that failed to load, and the difference matters:
@@ -288,9 +286,9 @@ class FavoriteSelect(OptimisticOptionMixin, KohlerValveEntity, SelectEntity):
         if self._experiences:
             return (
                 "No favorites to start. This valve's stored slots are experiences, "
-                "which carry no valve settings and cannot be started from Home "
-                "Assistant, plus the default-shower slot, which the Shower switch runs. "
-                "Create a favorite in the Kohler Konnect app and it appears here."
+                "which the Experience select starts, plus the default-shower slot, which "
+                "the Shower switch runs. Create a favorite in the Kohler Konnect app and "
+                "it appears here."
             )
         return (
             "No favorites have been created on this valve. The default-shower slot is "
@@ -318,9 +316,8 @@ class FavoriteSelect(OptimisticOptionMixin, KohlerValveEntity, SelectEntity):
             # is misleading when the thing plainly exists in the app.
             if option in self._experiences:
                 raise HomeAssistantError(
-                    f"{option!r} is an Anthem experience, not a favorite. Experiences "
-                    "carry no valve settings, so the shower ignores the command — start "
-                    "it from the Konnect app or the touchscreen instead."
+                    f"{option!r} is an Anthem experience, not a favorite. Start it from "
+                    "this valve's Experience select instead."
                 )
             raise HomeAssistantError(
                 f"No Anthem favorite called {option!r}. It may have been renamed or "
@@ -341,6 +338,85 @@ class FavoriteSelect(OptimisticOptionMixin, KohlerValveEntity, SelectEntity):
         # The command was accepted. The device's own confirmation is still in flight — 1.5 s
         # for a controller favorite, measured — so hold the guess until it lands rather than
         # dropping it on the next unrelated message.
+        self._arm_optimistic_expiry()
+
+
+class ValveExperienceSelect(OptimisticOptionMixin, KohlerValveEntity, SelectEntity):
+    """Start one of the valve's stored experiences, and show which one is running.
+
+    Experiences are firmware programs — Wake Up, Cool Down, the ice-shower routines — stored
+    in the same slots as favorites (``isExperience: "True"`` in ``gcs-preset``) and started
+    with the **same** ``controlpresetorexperience {preset, action}`` body: that is what
+    Konnect 3.0.6's current screens send for an experience id (17 and up).
+
+    ⚠️ **App-confirmed, not yet live-verified here.** Until 2026-10-07 this integration held
+    that the valve ignores the command for an experience, on no recorded test, and offered
+    none. If the valve does ignore it on some firmware, the dropdown falls back to ``Off``
+    once the grace runs out, because the valve never reports the experience as running.
+    """
+
+    _attr_icon = "mdi:creation"
+    _attr_name = "Experience"
+
+    def __init__(self, coordinator: KohlerAnthemCoordinator, valve: Valve) -> None:
+        super().__init__(coordinator, valve)
+        self._attr_unique_id = f"{self._device_id}_experience"
+
+    @property
+    def options(self) -> list[str]:
+        state = self._state
+        names = [] if state is None else [x.name for x in state.experiences()]
+        return [OPTION_OFF, *names]
+
+    def _running(self):
+        state = self._state
+        if state is None or state.active_preset_id is None:
+            return None
+        preset = state.presets.get(state.active_preset_id)
+        return preset if preset is not None and preset.is_experience else None
+
+    @property
+    def _device_option(self) -> str | None:
+        """The running experience, from ``presetOrExperienceId``, or ``Off``."""
+        if self._state is None:
+            return None
+        running = self._running()
+        return OPTION_OFF if running is None else running.name
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        running = self._running()
+        return {"active_experience_id": None if running is None else running.preset_id}
+
+    async def async_select_option(self, option: str) -> None:
+        """Start the named experience, or stop the running one. Resolved by name."""
+        if option == OPTION_OFF:
+            running = self._running()
+            if running is None:
+                return
+            await self._async_command(
+                OPTION_OFF,
+                self._valve.async_control_experience(running.preset_id, False),
+            )
+            return
+        state = self._state
+        experience = None if state is None else state.experience_by_name(option)
+        if experience is None:
+            raise HomeAssistantError(
+                f"No Anthem experience called {option!r} on this valve. Add it in the "
+                "Konnect app first."
+            )
+        await self._async_command(
+            option, self._valve.async_control_experience(experience.preset_id, True)
+        )
+
+    async def _async_command(self, option: str, action) -> None:
+        self._set_optimistic(option)
+        try:
+            await action
+        except Exception:
+            self._clear_optimistic()
+            raise
         self._arm_optimistic_expiry()
 
 
@@ -623,6 +699,88 @@ class HubFavoriteSelect(OptimisticOptionMixin, KohlerControllerEntity, SelectEnt
         # The command was accepted. The device's own confirmation is still in flight — 1.5 s
         # for a controller favorite, measured — so hold the guess until it lands rather than
         # dropping it on the next unrelated message.
+        self._arm_optimistic_expiry()
+
+
+class HubExperienceSelect(OptimisticOptionMixin, KohlerControllerEntity, SelectEntity):
+    """Start one of the controller's experiences, and show which one is running.
+
+    The controller's firmware programs — Breathe, Cool Down, Focus, the steam coaches, the
+    ice showers — listed by ``hub-experience/{id}/experiences`` under three categories, each
+    with its own control endpoint. The command is ``{name: <title>, status}`` on the
+    category's endpoint (``KohlerAnthemCoordinator.async_control_hub_experience`` picks it);
+    run state comes back as ``SHOWER_EXP_STS`` / ``STEAM_EXP_STS`` / ``ICE_SHOWER_EXP_STS``.
+
+    Experiences run from zone 1's first outlet — the app says so — whatever the favorite
+    setup. Added 2026-10-07 from Konnect 3.0.6; the endpoints were already known, the
+    catalogue and the run-state messages were not read until then.
+    """
+
+    _attr_icon = "mdi:creation"
+    _attr_name = "Experience"
+
+    def __init__(
+        self, coordinator: KohlerAnthemCoordinator, controller: Controller
+    ) -> None:
+        super().__init__(coordinator, controller)
+        self._attr_unique_id = f"{self._device_id}_experience"
+
+    @property
+    def _titles(self) -> list[str]:
+        titles: list[str] = []
+        for items in self._controller.experiences.values():
+            for item in items:
+                title = str(item.get("title") or item.get("name") or "").strip()
+                if title and title not in titles:
+                    titles.append(title)
+        return titles
+
+    @property
+    def options(self) -> list[str]:
+        titles = self._titles
+        state = self._state
+        running = None if state is None else state.active_experience
+        # Same carry as the favorite picker: a running title the catalogue lacks must still
+        # be a valid option, or Home Assistant logs an error on every update.
+        if running and running not in titles:
+            titles.append(running)
+        return [OPTION_OFF, *titles]
+
+    @property
+    def _device_option(self) -> str | None:
+        state = self._state
+        if state is None:
+            return None
+        return state.active_experience or OPTION_OFF
+
+    async def async_select_option(self, option: str) -> None:
+        """Start the named experience, or stop the running one."""
+        if option == OPTION_OFF:
+            state = self._state
+            running = None if state is None else state.active_experience
+            if running is None:
+                return
+            await self._async_command(
+                OPTION_OFF,
+                self.coordinator.async_control_hub_experience(
+                    self._controller, running, False
+                ),
+            )
+            return
+        await self._async_command(
+            option,
+            self.coordinator.async_control_hub_experience(
+                self._controller, option, True
+            ),
+        )
+
+    async def _async_command(self, option: str, action) -> None:
+        self._set_optimistic(option)
+        try:
+            await action
+        except Exception:
+            self._clear_optimistic()
+            raise
         self._arm_optimistic_expiry()
 
 

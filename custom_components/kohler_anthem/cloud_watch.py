@@ -105,10 +105,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 _LOGGER = logging.getLogger(__name__)
 
-#: The value Kohler's cloud reports for a reachable device. Compared case-insensitively —
-#: only ``"Connected"`` has ever been observed, and the negative value is **unconfirmed**,
-#: which is why this matches the positive rather than testing for a guessed negative.
+#: The values Kohler's cloud reports, compared case-insensitively. Only ``"Connected"`` has
+#: ever been captured; ``"Disconnected"`` is the negative Konnect 3.0.6 tests for
+#: (`mc0/n.java`, `ui/ota/f.java`), and the app treats a device as online **unless** it reads
+#: exactly that. This module matched only the positive until 2026-10-07, because the
+#: negative was unconfirmed; it now follows the app's rule, so an unfamiliar value no longer
+#: reads as an outage — it is logged once instead.
 CONNECTED = "connected"
+DISCONNECTED = "disconnected"
 
 
 def _utc_iso(stamp: float | None) -> str | None:
@@ -143,6 +147,8 @@ class CloudConnectionWatch:
         self._trigger: str | None = None
         self._checks = 0
         self._last_error: str | None = None
+        # The last unfamiliar `connectionState` logged, so each new one is said once.
+        self._unfamiliar: str | None = None
         # Present only if Kohler returns it for the valve. `hub-state` carries it; whether
         # `gcs-state` does is an open question, so this surfaces the answer the first time a
         # real read happens rather than waiting for someone to probe it by hand.
@@ -441,7 +447,15 @@ class CloudConnectionWatch:
             return
 
         was = self._connected
-        self._connected = str(reported).strip().lower() == CONNECTED
+        value = str(reported).strip().lower()
+        if value not in (CONNECTED, DISCONNECTED) and value != self._unfamiliar:
+            self._unfamiliar = value
+            _LOGGER.info(
+                "Kohler gcs-state reported an unfamiliar connectionState %r; treating it "
+                "as reachable, as the Konnect app does",
+                reported,
+            )
+        self._connected = value != DISCONNECTED
         if self._connected:
             _LOGGER.debug("Cloud check (%s): valve reachable (%s)", trigger, reported)
         elif was is not False:
