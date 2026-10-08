@@ -1,11 +1,48 @@
-"""Increment the Home Assistant manifest version."""
+"""Increment the Home Assistant manifest version — or keep one set by hand.
+
+With ``--keep-unreleased`` (the automatic release path), a manifest version that has no git
+tag yet is printed unchanged: somebody set it on purpose, and it is released as written.
+Only a version that is already tagged — the last release — is bumped.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
 import re
+import subprocess
 from pathlib import Path
+
+_VERSION = re.compile(r"^\d+(?:\.\d+)+$")
+
+
+def _key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def _tags() -> list[str]:
+    """Every release tag in the repository: plain dotted numbers, like ``0.24``."""
+    out = subprocess.run(
+        ["git", "tag", "--list"], check=True, capture_output=True, text=True
+    ).stdout
+    return [tag for tag in out.split() if _VERSION.match(tag)]
+
+
+def _unreleased(version: str, tags: list[str]) -> bool:
+    """True when ``version`` has no tag yet and is newer than every tag.
+
+    A hand-set version that is not newer than the last release is a mistake — releasing it
+    would publish an older number after a newer one — so it stops the release instead.
+    """
+    if version in tags:
+        return False
+    newest = max(tags, key=_key, default=None)
+    if newest is not None and _key(version) <= _key(newest):
+        raise ValueError(
+            f"manifest.json says {version}, which is not newer than the latest release "
+            f"{newest}. Set a higher version, or put back {newest} to have it bumped."
+        )
+    return True
 
 
 def _bump_minor(version: str) -> str:
@@ -60,11 +97,19 @@ def main() -> int:
         default="minor",
         help="Bump type: minor (default, the automatic release path) or major",
     )
+    parser.add_argument(
+        "--keep-unreleased",
+        action="store_true",
+        help="Leave a manifest version with no git tag yet unchanged instead of bumping it",
+    )
     args = parser.parse_args()
     manifest_path = args.manifest
     manifest_text = manifest_path.read_text(encoding="utf-8")
     manifest = json.loads(manifest_text)
     current_version = manifest["version"]
+    if args.keep_unreleased and _unreleased(current_version, _tags()):
+        print(current_version)
+        return 0
     bump = _bump_major if args.bump == "major" else _bump_minor
     next_version = bump(current_version)
     updated_text, replacements = re.subn(

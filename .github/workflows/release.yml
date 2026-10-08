@@ -1,10 +1,15 @@
 name: Release
 
 # Auto-releases on a green main: once BOTH the Test and Validate workflows have completed
-# successfully for the same commit, this bumps the manifest version, rotates CHANGELOG.md's
+# successfully for the same commit, this settles the version, rotates CHANGELOG.md's
 # Unreleased section into a version heading, and publishes a GitHub release — no draft, no
 # manual step. workflow_dispatch is the manual escape hatch (re-release the current manifest
 # version, or force a bump) for when the two-workflow handshake below needs a nudge.
+#
+# Which version: if manifest.json holds a version with no git tag yet, somebody set it by
+# hand, and it is released exactly as written. Otherwise — the manifest still says the last
+# release — the minor version is bumped. Until 2026-10-08 it always bumped, so setting 0.23
+# by hand published 0.24.
 #
 # Why two triggers instead of one: this repo runs Test (pytest + ruff) and Validate (HACS +
 # hassfest) as separate workflows, unlike a single combined CI workflow. workflow_run only
@@ -127,8 +132,15 @@ jobs:
         id: bump
         env:
           BUMP_TYPE: ${{ inputs.bump || 'minor' }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          new_version="$(python .github/scripts/bump_manifest_version.py --bump "$BUMP_TYPE")"
+          # A manual dispatch that asks for a bump always bumps. The automatic path keeps a
+          # hand-set, not-yet-released version — see the header.
+          keep=""
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            keep="--keep-unreleased"
+          fi
+          new_version="$(python .github/scripts/bump_manifest_version.py --bump "$BUMP_TYPE" $keep)"
           python .github/scripts/update_changelog.py "$new_version"
           echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
 
@@ -148,11 +160,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add custom_components/kohler_anthem/manifest.json CHANGELOG.md
-          git commit -m "chore(release): $NEW_VERSION [skip ci]"
+          # Nothing to commit when a hand-set version is kept and there was no Unreleased
+          # section to rotate: release the pushed commit itself.
+          if git diff --cached --quiet; then
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "chore(release): $NEW_VERSION [skip ci]"
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+          fi
           echo "release_target=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Push release commit
-        if: steps.head_check.outputs.release_action == 'bump'
+        if: steps.commit_release.outputs.committed == 'true'
         run: git push origin HEAD:main
 
       # GitHub's auto-generated notes only list merged PRs, so direct-to-main releases came
