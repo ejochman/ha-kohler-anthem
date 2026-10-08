@@ -25,10 +25,14 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    DEFAULT_ZONE_GROUPING,
     DEVICE_NAME_CONTROLLER,
     DEVICE_NAME_VALVE,
     DOMAIN,
     OUTLET_TYPE_NAMES,
+    ZONE_GROUPING_NUMBERED,
+    ZONE_GROUPING_OUTLET_LABELS,
+    ZONE_GROUPING_SUBDEVICES,
 )
 from .coordinator import Controller, KohlerAnthemCoordinator, Valve
 
@@ -48,29 +52,65 @@ def slug(name: str) -> str:
     return "_".join(part.lower() for part in name.split())
 
 
-def zone_label(device: Valve | Controller, zone: int, label: str) -> str:
-    """`Temperature` on a single-zone device, `Temperature 2` on a two-zone one.
+def _fixture_at(valve: Valve, zone: int, position: int) -> str | None:
+    """The confirmed fixture name for a 1-based outlet in this zone, or None."""
+    flat = valve.model.outlet_id(zone, position)
+    limits = valve.gcs_state.outlet_limits.get(flat)
+    code = None if limits is None else limits.outlet_type
+    return None if code is None else OUTLET_TYPE_NAMES.get(code)
+
+
+def zone_label(
+    device: Valve | Controller,
+    zone: int,
+    label: str,
+    grouping: str | None = None,
+) -> str:
+    """`Temperature` on a single-zone device, or disambiguated by the grouping mode.
 
     With one zone there is nothing to disambiguate, and a number on every entity of a
-    3-outlet valve is noise. A multi-zone valve appends the zone number, because a bare
-    `Temperature` would be ambiguous across zones.
+    3-outlet valve is noise. On a multi-zone valve, three modes are offered:
 
-    **The number is a suffix, not a `Zone N` prefix.** It sorts the related entities together
-    in every Home Assistant list — `Temperature`, `Temperature 2` rather than `Temperature`
-    stranded away from `Zone 2 Temperature` — and it reads the way the fixtures do
-    (`Showerhead 1`, `Showerhead 2`).
+    * **Numbered (default)** — appends the zone number (`Temperature 1`, `Temperature 2`).
+    * **Separate zone sub-devices** — each zone is its own device (`Anthem Valve Zone 1`),
+      so the entity inside that device needs no suffix (`Temperature`).
+    * **Outlet-labelled controls** — stays on one device and names the zone's outlets on
+      the control or sensor (`Temperature (Showerhead, Body Sprays)`), falling back to
+      the zone number until at least one fixture in the zone is known.
 
-    Takes a valve or a controller — both carry a `model`, and only the zone count is read,
-    so the controller's own zone entities are named the same way the valve's are. They were
-    not, until 0.8.1: a controller showed `Zone 1 Temperature` beside the valve's plain
-    `Temperature`, which read as two different things rather than two views of one shower.
+    Takes a valve or a controller — both carry a `model`. A controller has no per-outlet
+    fixture codes, so on a multi-zone controller it always appends the zone number.
     """
     if len(device.model.zones) <= 1:
         return label
+    if hasattr(device, "gcs_state"):
+        mode = (
+            grouping
+            if grouping is not None
+            else getattr(device, "zone_grouping", DEFAULT_ZONE_GROUPING)
+        )
+        if mode == ZONE_GROUPING_SUBDEVICES:
+            return label
+        if mode == ZONE_GROUPING_OUTLET_LABELS:
+            count = device.model.outlets_in_zone(zone)
+            if any(
+                _fixture_at(device, zone, pos) is not None
+                for pos in range(1, count + 1)
+            ):
+                outlets = ", ".join(
+                    outlet_name(device, zone, pos, grouping=ZONE_GROUPING_SUBDEVICES)
+                    for pos in range(1, count + 1)
+                )
+                return f"{label} ({outlets})"
     return f"{label} {zone}"
 
 
-def outlet_name(valve: Valve, zone: int, outlet: int) -> str:
+def outlet_name(
+    valve: Valve,
+    zone: int,
+    outlet: int,
+    grouping: str | None = None,
+) -> str:
     """`Rainhead`, `Rainhead 2` on a multi-zone valve, or `Outlet 1` when unknown.
 
     Lives here rather than on the switch because the outlet's run-time sensor needs the
@@ -81,29 +121,34 @@ def outlet_name(valve: Valve, zone: int, outlet: int) -> str:
 
     * **The fixture name wins** where the valve's `outLetType` maps to a confirmed one —
       `Rainhead` says what the entity does in a way `Outlet 1` never can.
-    * **The zone number is dropped on a single-zone valve**, per :func:`zone_label`.
-    * **An unknown code falls back to the position** — `Zone 1 Outlet 3`. Naming an outlet
-      after a code nobody has confirmed would be inventing a fixture; the number is honest.
+    * **The zone suffix follows the grouping mode:**
+      - Single-zone valves and `subdevices` mode drop the zone number (`Showerhead`),
+        since the device itself scopes the zone.
+      - `outlet_labels` mode drops the zone number whenever the fixture type is unique
+        across the valve (`Showerhead`, `Body Sprays`, `Rainhead`, `Handshower`),
+        keeping it only if both zones carry the same fixture type on the single device.
+      - `numbered` mode appends the zone number on multi-zone valves (`Showerhead 1`).
+    * **An unknown code falls back to the position** — `Outlet 1` (or `Outlet 1.2` when
+      multiple zones share one device). Naming an outlet after a code nobody has
+      confirmed would be inventing a fixture; the number is honest.
 
     Read **once, at construction**. Per-outlet types arrive gradually over MQTT and via the
     REST seed, so a valve that has not announced yet names its outlets by position and picks
     up fixture names on the next restart. Renaming entities live would change their ids
     underneath running automations, which is worse than waiting.
     """
+    mode = (
+        grouping
+        if grouping is not None
+        else getattr(valve, "zone_grouping", DEFAULT_ZONE_GROUPING)
+    )
+    single_zone_scope = len(valve.model.zones) <= 1 or mode == ZONE_GROUPING_SUBDEVICES
 
-    def fixture_at(position: int) -> str | None:
-        """The confirmed fixture name for a 1-based outlet in this zone, or None."""
-        flat = valve.model.outlet_id(zone, position)
-        limits = valve.gcs_state.outlet_limits.get(flat)
-        code = None if limits is None else limits.outlet_type
-        return None if code is None else OUTLET_TYPE_NAMES.get(code)
-
-    fixture = fixture_at(outlet)
+    fixture = _fixture_at(valve, zone, outlet)
     if fixture is None:
-        # No confirmed fixture: name it by position. `Outlet 1` on a single-zone valve, and
-        # `Outlet 1.2` on a multi-zone one, matching the fixture numbering below rather than
-        # reintroducing a `Zone N` prefix the rest of the scheme has dropped.
-        if len(valve.model.zones) > 1:
+        # No confirmed fixture: name it by position. `Outlet 1` when scoped to one zone,
+        # and `Outlet 1.2` on a multi-zone single device, matching the numbering below.
+        if not single_zone_scope:
             return f"Outlet {zone}.{outlet}"
         return f"Outlet {outlet}"
 
@@ -115,19 +160,35 @@ def outlet_name(valve: Valve, zone: int, outlet: int) -> str:
     same = [
         position
         for position in range(1, valve.model.outlets_in_zone(zone) + 1)
-        if fixture_at(position) == fixture
+        if _fixture_at(valve, zone, position) == fixture
     ]
     if len(same) > 1:
         # Both this suffix and `zone_label`'s are bare numbers, so applying them together
         # would read `Showerhead 2 1` — two numbers meaning different things, in an order
         # nobody can guess. The zone leads, because that is the coarser grouping: the second
-        # showerhead in zone 2 is `Showerhead 2.2`, and in a single-zone valve just
+        # showerhead in zone 2 is `Showerhead 2.2`, and in a single-zone scope just
         # `Showerhead 2`.
         position = same.index(outlet) + 1
-        if len(valve.model.zones) > 1:
+        if not single_zone_scope:
             return f"{fixture} {zone}.{position}"
         return f"{fixture} {position}"
-    return zone_label(valve, zone, fixture)
+
+    if single_zone_scope:
+        return fixture
+
+    if mode == ZONE_GROUPING_OUTLET_LABELS:
+        # Omit the zone number when this fixture type appears in only one zone.
+        zones_with_fixture = [
+            z
+            for z in valve.model.zones
+            for pos in range(1, valve.model.outlets_in_zone(z) + 1)
+            if _fixture_at(valve, z, pos) == fixture
+        ]
+        if len(zones_with_fixture) == 1:
+            return fixture
+        return f"{fixture} {zone}"
+
+    return zone_label(valve, zone, fixture, grouping=ZONE_GROUPING_NUMBERED)
 
 
 class KohlerValveEntity(CoordinatorEntity[KohlerAnthemCoordinator]):
@@ -137,27 +198,55 @@ class KohlerValveEntity(CoordinatorEntity[KohlerAnthemCoordinator]):
     controller base takes a `Controller`: the coordinator holds every valve on the account,
     and an entity reads and commands exactly one. Unique ids are built on that valve's
     device id, so a single-valve install keeps every id it had.
+
+    When `zone` is supplied on a multi-zone valve and the entry is configured for
+    per-zone sub-devices (`ZONE_GROUPING_SUBDEVICES`), the entity attaches to that
+    zone's sub-device (`Anthem Valve Zone 1` / `Zone 2`) linked via `via_device` to the
+    parent valve device while keeping `self._device_id` (and therefore `unique_id`)
+    unchanged.
     """
 
     _attr_has_entity_name = True
 
-    def __init__(self, coordinator: KohlerAnthemCoordinator, valve: Valve) -> None:
+    def __init__(
+        self,
+        coordinator: KohlerAnthemCoordinator,
+        valve: Valve,
+        *,
+        zone: int | None = None,
+    ) -> None:
         super().__init__(coordinator)
         self._valve = valve
         self._device_id = valve.device_id
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, valve.device_id)},
-            # "Anthem Valve" alone with one valve; suffixed with the Konnect name when
-            # there are several — see `coordinator.valve_names`.
-            name=valve.name,
-            manufacturer="Kohler",
-            # The valve's own layout — detected from the valve, else the model chosen at
-            # setup — which is what is printed on the hardware, far more useful than the
-            # API's "GCS".
-            model=valve.model.sku,
-            model_id=valve.model.name,
-            serial_number=valve.gcs_device.serial_number,
-        )
+        grouping = getattr(valve, "zone_grouping", DEFAULT_ZONE_GROUPING)
+        if (
+            zone is not None
+            and len(valve.model.zones) > 1
+            and grouping == ZONE_GROUPING_SUBDEVICES
+        ):
+            self._attr_device_info = DeviceInfo(
+                identifiers={(DOMAIN, f"{valve.device_id}_zone_{zone}")},
+                via_device=(DOMAIN, valve.device_id),
+                name=f"{valve.name} Zone {zone}",
+                manufacturer="Kohler",
+                model=valve.model.sku,
+                model_id=f"{valve.model.name} (Zone {zone})",
+                serial_number=valve.gcs_device.serial_number,
+            )
+        else:
+            self._attr_device_info = DeviceInfo(
+                identifiers={(DOMAIN, valve.device_id)},
+                # "Anthem Valve" alone with one valve; suffixed with the Konnect name
+                # when there are several — see `coordinator.valve_names`.
+                name=valve.name,
+                manufacturer="Kohler",
+                # The valve's own layout — detected from the valve, else the model
+                # chosen at setup — which is what is printed on the hardware, far more
+                # useful than the API's "GCS".
+                model=valve.model.sku,
+                model_id=valve.model.name,
+                serial_number=valve.gcs_device.serial_number,
+            )
 
     @property
     def _state(self):
@@ -180,7 +269,7 @@ class ZoneWordEntity(KohlerValveEntity):
     def __init__(
         self, coordinator: KohlerAnthemCoordinator, valve: Valve, zone: int
     ) -> None:
-        super().__init__(coordinator, valve)
+        super().__init__(coordinator, valve, zone=zone)
         self._zone = zone
 
     @property

@@ -32,11 +32,14 @@ from homeassistant.helpers.event import async_call_later
 
 from .anthem import WARMUP_MODES_CURRENT
 from .const import (
+    DEFAULT_ZONE_GROUPING,
     DOMAIN,
     OUTLET_RUN_TIME_APP_SAFE_MAX_SECONDS,
     OUTLET_RUN_TIME_CHOICES_SECONDS,
     PRESET_HIDDEN_IDS,
     WARMUP_LABELS,
+    ZONE_GROUPING_OUTLET_LABELS,
+    ZONE_GROUPING_SUBDEVICES,
 )
 from .coordinator import Controller, KohlerAnthemCoordinator, Valve
 from .entity import KohlerControllerEntity, KohlerValveEntity, outlet_name
@@ -872,12 +875,19 @@ class OutletRunTimeSelect(KohlerValveEntity, SelectEntity):
         if run_times:
             attributes["outlets_agree"] = len(set(run_times.values())) == 1
             per_outlet: dict[str, float] = {}
+            raw_grouping = getattr(self._valve, "zone_grouping", DEFAULT_ZONE_GROUPING)
+            grouping = (
+                ZONE_GROUPING_OUTLET_LABELS
+                if raw_grouping == ZONE_GROUPING_SUBDEVICES
+                else raw_grouping
+            )
             for outlet, value in sorted(run_times.items()):
                 # `outlet_run_times` is 1-based and `outlet_location` expects that — passing
                 # `outlet + 1` here is the off-by-one that made the old sensor raise on every
                 # attribute read and show `unknown` (fixed 0.16.1).
                 zone, index = self._valve.model.outlet_location(outlet)
-                per_outlet[outlet_name(self._valve, zone, index + 1)] = value / 60
+                name = outlet_name(self._valve, zone, index + 1, grouping=grouping)
+                per_outlet[name] = value / 60
             attributes["per_outlet"] = per_outlet
         return attributes
 

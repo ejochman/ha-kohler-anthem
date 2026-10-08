@@ -435,7 +435,10 @@ def _resolve_valve(hass: HomeAssistant, device_id: str | None) -> Valve:
             identifier for domain, identifier in device.identifiers if domain == DOMAIN
         }
         for valve in valves:
-            if valve.device_id in wanted:
+            if any(
+                ident == valve.device_id or ident.startswith(f"{valve.device_id}_zone_")
+                for ident in wanted
+            ):
                 return valve
         raise ServiceValidationError(
             f"{device.name_by_user or device.name} is not an Anthem valve; choose the "

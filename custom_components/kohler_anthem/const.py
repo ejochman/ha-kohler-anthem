@@ -47,6 +47,21 @@ CONF_MOBILE_DEVICE_ID = "mobile_device_id"
 # Reload-ignored in both lists for the same reason every one of those keys was.
 CONF_VALVES = "valves"
 
+# How multi-zone valve outlets, controls, and sensors are grouped and named. Stored in
+# `entry.options[CONF_ZONE_GROUPING]` via the Configure dialog and deliberately NOT in
+# `RELOAD_IGNORED_OPTION_KEYS` — changing it reloads the entry so entities and zone
+# sub-devices re-register with the chosen layout.
+CONF_ZONE_GROUPING = "zone_grouping"
+ZONE_GROUPING_NUMBERED = "numbered"
+ZONE_GROUPING_SUBDEVICES = "subdevices"
+ZONE_GROUPING_OUTLET_LABELS = "outlet_labels"
+ZONE_GROUPING_MODES: tuple[str, ...] = (
+    ZONE_GROUPING_NUMBERED,
+    ZONE_GROUPING_SUBDEVICES,
+    ZONE_GROUPING_OUTLET_LABELS,
+)
+DEFAULT_ZONE_GROUPING = ZONE_GROUPING_NUMBERED
+
 # ---------------------------------------------------------------------------
 # Polling — deliberately none
 # ---------------------------------------------------------------------------

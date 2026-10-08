@@ -42,6 +42,7 @@ from .const import (
     WARMUP_AUTO_RESTORE_DELAY_SECONDS,
     WARMUP_AUTO_RESTORE_NO_TARGET,
     WARMUP_AUTO_RESTORE_ON,
+    ZONE_GROUPING_NUMBERED,
 )
 from .coordinator import Controller, KohlerAnthemCoordinator, Valve
 from .entity import (
@@ -395,16 +396,17 @@ class ZoneOutletSwitch(KohlerValveEntity, SwitchEntity):
         zone: int,
         outlet: int,
     ) -> None:
-        super().__init__(coordinator, valve)
+        super().__init__(coordinator, valve, zone=zone)
         self._zone = zone
         self._outlet = outlet
         self._attr_name = outlet_name(valve, zone, outlet)
-        # **The unique id follows the name**, so an outlet whose fixture is known gets
-        # `..._rainhead` rather than `..._zone_1_outlet_1`. That is a deliberate break: an
-        # entity id naming the fixture is worth more than one naming a position, and Home
-        # Assistant keeps the registry entry keyed on this string. See `entity.outlet_name`
-        # for what happens when the fixture is not known.
-        self._attr_unique_id = f"{self._device_id}_{slug(self._attr_name)}"
+        # **The unique id follows the canonical numbered name**, so an outlet whose
+        # fixture is known gets `..._rainhead` (or `..._rainhead_1`) rather than
+        # `..._zone_1_outlet_1`, while changing `zone_grouping` in Configure updates
+        # the existing entity in place rather than orphaning it or colliding across
+        # sub-devices.
+        canonical = outlet_name(valve, zone, outlet, grouping=ZONE_GROUPING_NUMBERED)
+        self._attr_unique_id = f"{self._device_id}_{slug(canonical)}"
         # Holds the requested position until the valve reports back. None means "no
         # pending command — show what the valve says".
         self._optimistic: bool | None = None

@@ -3584,3 +3584,313 @@ def test_k28211_hardware_outlet_ids_skip_unused_valve1_slot():
         "Rainhead 2": 30.0,
         "Handshower 2": 30.0,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Configurable zone grouping: numbered, sub-devices, and outlet-labelled
+# --------------------------------------------------------------------------- #
+def test_zone_grouping_subdevices_splits_zones_and_drops_zone_numbers():
+    """In `subdevices` mode, each zone on a multi-zone valve is a child device."""
+    from custom_components.kohler_anthem.anthem.models import get_valve_model
+    from custom_components.kohler_anthem.const import ZONE_GROUPING_SUBDEVICES
+
+    model = get_valve_model("K-28211")
+    valve = make_valve(model, [11, 52, 31, 1], zone_grouping=ZONE_GROUPING_SUBDEVICES)
+    coordinator = make_coordinator([valve], zone_grouping=ZONE_GROUPING_SUBDEVICES)
+
+    switches = {e.unique_id: e for e in collect("switch", coordinator)}
+    outlet_switches = [
+        switches["gcs-test0001_showerhead_1"],
+        switches["gcs-test0001_body_sprays_1"],
+        switches["gcs-test0001_rainhead_2"],
+        switches["gcs-test0001_handshower_2"],
+    ]
+    assert [e.name for e in outlet_switches] == [
+        "Showerhead",
+        "Body Sprays",
+        "Rainhead",
+        "Handshower",
+    ]
+    assert outlet_switches[0].device_info["identifiers"] == {
+        ("kohler_anthem", "gcs-test0001_zone_1")
+    }
+    assert outlet_switches[0].device_info["via_device"] == (
+        "kohler_anthem",
+        "gcs-test0001",
+    )
+    assert outlet_switches[0].device_info["name"] == "Anthem Valve Zone 1"
+    assert outlet_switches[2].device_info["identifiers"] == {
+        ("kohler_anthem", "gcs-test0001_zone_2")
+    }
+    assert outlet_switches[2].device_info["name"] == "Anthem Valve Zone 2"
+
+    # Whole-valve switch stays on the parent valve device.
+    assert switches["gcs-test0001_shower"].device_info["identifiers"] == {
+        ("kohler_anthem", "gcs-test0001")
+    }
+
+    numbers = {e.unique_id: e for e in collect("number", coordinator)}
+    assert numbers["gcs-test0001_temperature_zone_1"].name == "Temperature"
+    assert numbers["gcs-test0001_temperature_zone_2"].name == "Temperature"
+    assert numbers["gcs-test0001_flow_zone_1"].name == "Flow"
+    assert numbers["gcs-test0001_flow_zone_2"].name == "Flow"
+    assert numbers["gcs-test0001_temperature_zone_1"].device_info["identifiers"] == {
+        ("kohler_anthem", "gcs-test0001_zone_1")
+    }
+    assert numbers["gcs-test0001_temperature_zone_2"].device_info["identifiers"] == {
+        ("kohler_anthem", "gcs-test0001_zone_2")
+    }
+
+    active = {e.unique_id: e for e in _zone_active(coordinator)}
+    assert active["gcs-test0001_zone_1_active"].name == "Zone Active"
+    assert active["gcs-test0001_zone_2_active"].name == "Zone Active"
+    assert active["gcs-test0001_zone_1_active"].device_info["identifiers"] == {
+        ("kohler_anthem", "gcs-test0001_zone_1")
+    }
+    assert active["gcs-test0001_zone_2_active"].device_info["identifiers"] == {
+        ("kohler_anthem", "gcs-test0001_zone_2")
+    }
+
+    sensors = {e.unique_id: e for e in collect("sensor", coordinator)}
+    assert sensors["gcs-test0001_zone_1_hex"].name == "Hex"
+    assert sensors["gcs-test0001_zone_2_hex"].name == "Hex"
+    assert sensors["gcs-test0001_zone_1_hex"].device_info["identifiers"] == {
+        ("kohler_anthem", "gcs-test0001_zone_1")
+    }
+    assert sensors["gcs-test0001_zone_2_hex"].device_info["identifiers"] == {
+        ("kohler_anthem", "gcs-test0001_zone_2")
+    }
+
+
+def test_zone_grouping_outlet_labels_names_controls_after_zone_outlets():
+    """In `outlet_labels` mode, one device is kept and controls list their outlets."""
+    from custom_components.kohler_anthem.anthem.models import get_valve_model
+    from custom_components.kohler_anthem.const import ZONE_GROUPING_OUTLET_LABELS
+
+    model = get_valve_model("K-28211")
+    valve = make_valve(
+        model, [11, 52, 31, 1], zone_grouping=ZONE_GROUPING_OUTLET_LABELS
+    )
+    coordinator = make_coordinator([valve], zone_grouping=ZONE_GROUPING_OUTLET_LABELS)
+
+    switches = {e.unique_id: e for e in collect("switch", coordinator)}
+    assert [
+        switches["gcs-test0001_showerhead_1"].name,
+        switches["gcs-test0001_body_sprays_1"].name,
+        switches["gcs-test0001_rainhead_2"].name,
+        switches["gcs-test0001_handshower_2"].name,
+    ] == ["Showerhead", "Body Sprays", "Rainhead", "Handshower"]
+    assert switches["gcs-test0001_showerhead_1"].device_info["identifiers"] == {
+        ("kohler_anthem", "gcs-test0001")
+    }
+
+    assert _zone_number_names(coordinator) == {
+        "Temperature (Showerhead, Body Sprays)",
+        "Flow (Showerhead, Body Sprays)",
+        "Temperature (Rainhead, Handshower)",
+        "Flow (Rainhead, Handshower)",
+    }
+
+    active = sorted(_zone_active(coordinator), key=lambda e: e.unique_id)
+    assert [e.name for e in active] == [
+        "Zone Active (Showerhead, Body Sprays)",
+        "Zone Active (Rainhead, Handshower)",
+    ]
+
+
+def test_unique_ids_stay_identical_across_all_zone_grouping_modes():
+    """Switching grouping modes updates entities in place without orphaning them."""
+    from custom_components.kohler_anthem.anthem.models import get_valve_model
+    from custom_components.kohler_anthem.const import ZONE_GROUPING_MODES
+
+    model = get_valve_model("K-28211")
+    for types in ([11, 52, 31, 1], [11, 52, 11, 1], [11, 11, 11, 11]):
+        by_mode: dict[str, dict[str, list[str]]] = {}
+        for mode in ZONE_GROUPING_MODES:
+            valve = make_valve(model, types, zone_grouping=mode)
+            coordinator = make_coordinator([valve], zone_grouping=mode)
+            by_mode[mode] = {
+                name: sorted(e.unique_id for e in collect(name, coordinator))
+                for name in PLATFORMS
+            }
+        baseline = by_mode["numbered"]
+        for mode, uids in by_mode.items():
+            assert uids == baseline, f"unique_ids diverged in {mode} for {types}"
+
+
+def test_outlet_labels_disambiguates_shared_fixtures_and_falls_back_when_unseeded():
+    """Shared fixtures keep zone numbers on one device; unseeded zones use numbers."""
+    from custom_components.kohler_anthem.anthem.models import get_valve_model
+    from custom_components.kohler_anthem.const import (
+        ZONE_GROUPING_OUTLET_LABELS,
+        ZONE_GROUPING_SUBDEVICES,
+    )
+    from custom_components.kohler_anthem.entity import outlet_name, zone_label
+    from custom_components.kohler_anthem.select import OutletRunTimeSelect
+
+    model = get_valve_model("K-28211")
+    shared = make_valve(
+        model, [11, 52, 11, 1], zone_grouping=ZONE_GROUPING_OUTLET_LABELS
+    )
+    assert [
+        outlet_name(shared, z, o)
+        for z in model.zones
+        for o in range(1, model.outlets_in_zone(z) + 1)
+    ] == ["Showerhead 1", "Body Sprays", "Showerhead 2", "Handshower"]
+
+    # On the whole-valve Max Shower Duration select, `subdevices` mode still uses
+    # disambiguated keys in `per_outlet` so two zones with a Showerhead never collide.
+    sub_valve = make_valve(
+        model, [11, 52, 11, 1], zone_grouping=ZONE_GROUPING_SUBDEVICES
+    )
+    select = OutletRunTimeSelect(
+        make_coordinator([sub_valve], zone_grouping=ZONE_GROUPING_SUBDEVICES),
+        sub_valve,
+    )
+    assert select.extra_state_attributes["per_outlet"] == {
+        "Showerhead 1": 30.0,
+        "Body Sprays": 30.0,
+        "Showerhead 2": 30.0,
+        "Handshower": 30.0,
+    }
+
+    unseeded = make_valve(
+        model, [None, None, None, None], zone_grouping=ZONE_GROUPING_OUTLET_LABELS
+    )
+    assert zone_label(unseeded, 1, "Temperature") == "Temperature 1"
+    assert zone_label(unseeded, 2, "Temperature") == "Temperature 2"
+
+
+def test_single_zone_valve_never_creates_zone_subdevices(valve_model):
+    """A single-zone valve stays on one device regardless of `zone_grouping`."""
+    from custom_components.kohler_anthem.const import ZONE_GROUPING_SUBDEVICES
+
+    valve = make_valve(valve_model, [31, 11, 1], zone_grouping=ZONE_GROUPING_SUBDEVICES)
+    coordinator = make_coordinator([valve], zone_grouping=ZONE_GROUPING_SUBDEVICES)
+    for name in PLATFORMS:
+        for entity in collect(name, coordinator):
+            assert entity.device_info["identifiers"] == {
+                ("kohler_anthem", "gcs-test0001")
+            }
+
+
+def test_options_flow_merges_existing_options_and_reloads_on_grouping_change():
+    """Saving Configure preserves per-valve options and reloads on grouping change."""
+    from custom_components.kohler_anthem.config_flow import (
+        KohlerAnthemConfigFlow,
+        KohlerAnthemOptionsFlow,
+    )
+    from custom_components.kohler_anthem.const import (
+        CONF_REPORT_LOG_FILE,
+        CONF_VALVES,
+        CONF_ZONE_GROUPING,
+        ZONE_GROUPING_NUMBERED,
+        ZONE_GROUPING_SUBDEVICES,
+    )
+    from custom_components.kohler_anthem.coordinator import entry_reload_signature
+
+    existing = {
+        CONF_VALVES: {"gcs-test0001": {"warmup_auto_restore": True}},
+        CONF_REPORT_LOG_FILE: "report_2026.jsonl",
+    }
+    entry = SimpleNamespace(
+        entry_id="test",
+        data={"username": "user@example.com"},
+        options=dict(existing),
+    )
+
+    flow = KohlerAnthemConfigFlow.async_get_options_flow(entry)
+    assert isinstance(flow, KohlerAnthemOptionsFlow)
+
+    form = asyncio.run(flow.async_step_init(None))
+    assert form["type"] == "form"
+    assert form["step_id"] == "init"
+
+    saved = asyncio.run(
+        flow.async_step_init({CONF_ZONE_GROUPING: ZONE_GROUPING_SUBDEVICES})
+    )
+    assert saved["type"] == "create_entry"
+    assert saved["data"] == {
+        **existing,
+        CONF_ZONE_GROUPING: ZONE_GROUPING_SUBDEVICES,
+    }
+
+    before = entry_reload_signature(entry)
+    after_entry = SimpleNamespace(
+        entry_id="test",
+        data=entry.data,
+        options=saved["data"],
+    )
+    assert entry_reload_signature(after_entry) != before
+
+    numbered_entry = SimpleNamespace(
+        entry_id="test",
+        data=entry.data,
+        options={**existing, CONF_ZONE_GROUPING: ZONE_GROUPING_NUMBERED},
+    )
+    assert entry_reload_signature(after_entry) != entry_reload_signature(numbered_entry)
+
+
+def test_zone_subdevice_cleanup_and_service_resolution(monkeypatch):
+    """Stale zone sub-devices are removed on mode switch; services accept sub-devices."""
+    from homeassistant.helpers import device_registry as dr
+
+    from custom_components.kohler_anthem import _async_cleanup_zone_subdevices
+    from custom_components.kohler_anthem.anthem.models import get_valve_model
+    from custom_components.kohler_anthem.const import (
+        ZONE_GROUPING_NUMBERED,
+        ZONE_GROUPING_SUBDEVICES,
+    )
+    from custom_components.kohler_anthem.services import _resolve_valve
+
+    model = get_valve_model("K-28211")
+    valve = make_valve(model, [11, 52, 31, 1], zone_grouping=ZONE_GROUPING_SUBDEVICES)
+    coordinator = make_coordinator([valve], zone_grouping=ZONE_GROUPING_SUBDEVICES)
+
+    parent_dev = SimpleNamespace(
+        id="dev-parent",
+        name="Anthem Valve",
+        name_by_user=None,
+        identifiers={("kohler_anthem", "gcs-test0001")},
+    )
+    zone1_dev = SimpleNamespace(
+        id="dev-zone-1",
+        name="Anthem Valve Zone 1",
+        name_by_user=None,
+        identifiers={("kohler_anthem", "gcs-test0001_zone_1")},
+    )
+    removed: list[str] = []
+
+    class FakeDeviceRegistry:
+        def __init__(self) -> None:
+            self.devices = {"dev-parent": parent_dev, "dev-zone-1": zone1_dev}
+
+        def async_get(self, dev_id: str):
+            return self.devices.get(dev_id)
+
+        def async_remove_device(self, dev_id: str) -> None:
+            removed.append(dev_id)
+            self.devices.pop(dev_id, None)
+
+    reg = FakeDeviceRegistry()
+    hass = SimpleNamespace(data={"kohler_anthem": {"test": coordinator}})
+    entry = SimpleNamespace(entry_id="test", data={}, options={})
+
+    monkeypatch.setattr(dr, "async_get", lambda h: reg)
+    monkeypatch.setattr(
+        dr,
+        "async_entries_for_config_entry",
+        lambda r, eid: list(r.devices.values()),
+    )
+
+    assert _resolve_valve(hass, "dev-zone-1") is valve
+
+    # While `subdevices` is active, zone sub-devices are kept.
+    _async_cleanup_zone_subdevices(hass, entry, coordinator)
+    assert removed == []
+
+    # Switching back to `numbered` removes the zone sub-device.
+    coordinator.zone_grouping = ZONE_GROUPING_NUMBERED
+    _async_cleanup_zone_subdevices(hass, entry, coordinator)
+    assert removed == ["dev-zone-1"]
+    assert "dev-parent" in reg.devices
