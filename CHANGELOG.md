@@ -5,6 +5,22 @@ Notable changes for each tagged release. Versions correspond to git tags and to 
 **Unreleased** as part of each change; the release workflow rotates that section into a
 version heading and publishes it as the release's Highlights.
 
+
+## Unreleased
+
+**New**
+
+- Multi-zone Anthem valves previously always appended the zone number to every outlet switch, temperature/flow slider, active binary sensor, and zone hex sensor (e.g. 'Showerhead 1', 'Temperature 1').
+- Add a 'Zone & outlet grouping' option under Settings -> Devices & services -> Kohler Anthem -> Configure (CONF_ZONE_GROUPING) with three modes:
+
+    'subdevices': Splits each zone on a multi-zone valve into its own child device ('Anthem Valve Zone 1', 'Anthem Valve Zone 2') linked via via_device to the parent valve, and drops the trailing zone numbers from outlet switches ('Showerhead', 'Body Sprays'), controls ('Temperature', 'Flow'), and sensors ('Zone Active', 'Hex'). Whole-valve entities remain on the parent valve device.
+
+    'outlet_labels': Keeps a single device per valve, drops redundant zone numbers from outlet switches (unless the same fixture type appears in multiple zones), and labels per-zone controls and sensors with their zone's fixtures (e.g. 'Temperature (Showerhead, Body Sprays)', 'Zone Active (Showerhead, Body Sprays)').
+
+    'numbered' (default): Preserves the existing single-device numbered naming ('Showerhead 1', 'Temperature 1', 'Shower Active 1').
+
+- Entity unique_ids remain identical across all three modes so switching modes updates existing entities in place without orphaning them, and stale zone child devices are automatically cleaned up when switching away from 'subdevices'.
+
 ## 0.22 — 2026-10-08
 
 **New**
