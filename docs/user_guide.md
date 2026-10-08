@@ -185,7 +185,7 @@ position: `Outlet 1`, or `Outlet 2.1` on a multi-zone valve.
 | `System State` | sensor | The valve's own `normalOperation` / `showerInProgress` flag — a second opinion to `System Status`, decoded differently. Also `error` and `FirmwareUpdate`, which the Konnect app acts on but no install has yet been seen to send |
 | `At Temperature` | binary sensor | Whether the water has reached its setpoint |
 | `Problem` | binary sensor | Whether the valve reports a fault — the error flag in its status word, or a `System State` of `error` |
-| `Firmware`, `Gateway Firmware` | update | Installed and latest firmware for the valve and its Wi-Fi gateway, checked twice a day. **Read-only** — install updates in the Konnect app, which guards against installing mid-shower |
+| `Firmware Status`, `Gateway Firmware Status` | update | Whether a firmware update is available for the valve and its Wi-Fi gateway, with installed and latest versions, checked twice a day. **Read-only** — install updates in the Konnect app, which guards against installing mid-shower. The version numbers alone are the `Interface Firmware`, `Valve Firmware` and `Gateway Firmware` diagnostic sensors |
 | `Restart` | button | Reboots the valve, as the app's *Restart Product* does. **Disabled by default** — a button can't ask "are you sure?", so enable it on purpose. Stops any running water; can't revive a valve that has dropped off the cloud |
 
 #### The three settings the Konnect app also has
@@ -266,7 +266,7 @@ reading.
 | `Music` / `Light` / `Steam` | binary sensor | Accessory state. `Light` carries each light group's own state; `Steam` carries temperature, timers and `power_clean` (the generator's self-clean) |
 | `Problem` | binary sensor | A fault the controller reports, an active error (its title and code are attributes), or an accessory that is set up but has stopped responding — "Steam is disconnected", an SD card missing — the cases the app shows as error cards |
 | `Max Shower Duration` | sensor | The controller's own limit on a shower, in minutes. The shorter of this and the valve's `Max Shower Duration` ends a shower — see [Shower time limits](#shower-time-limits) |
-| `Firmware` | update | Installed and latest controller firmware, checked twice a day. Read-only |
+| `Firmware Status` | update | Whether a controller firmware update is available, with installed and latest versions, checked twice a day. Read-only |
 
 The controller's device page also has a **Visit** link to its own web settings page — where its
 Max Shower Duration and other settings are changed — using the network address Kohler's

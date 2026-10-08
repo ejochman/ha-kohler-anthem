@@ -587,3 +587,22 @@ def test_the_controller_device_links_to_its_web_page():
     assert entities
     for entity in entities:
         assert entity.device_info["configuration_url"] == "http://192.168.1.40/"
+
+
+def test_firmware_status_entities_use_icons_and_not_the_version_names():
+    """Named apart from the version sensors, and no brand image hiding the state icon."""
+    model = _model()
+    coordinator = make_coordinator(
+        [make_valve(model, [31, 11, 1])], [make_controller(model)]
+    )
+    updates = collect("update", coordinator)
+    assert sorted(e.name for e in updates) == [
+        "Firmware Status",
+        "Firmware Status",
+        "Gateway Firmware Status",
+    ]
+    assert all(e.entity_picture is None for e in updates)
+    version_sensors = {
+        e.name for e in collect("sensor", coordinator) if "Firmware" in (e.name or "")
+    }
+    assert not version_sensors & {e.name for e in updates}

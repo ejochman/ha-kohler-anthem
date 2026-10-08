@@ -14,6 +14,12 @@ Read twice a day (`FIRMWARE_CHECK_INTERVAL`) — nothing pushes a release.
 
 Never seen reporting an available update on the reference system, which has been current
 throughout.
+
+**Named "… Firmware Status", not "… Firmware".** The version numbers themselves are the
+diagnostic sensors `Interface Firmware`, `Valve Firmware` and `Gateway Firmware`; these
+entities answer "is there an update", and a shared name put two `Gateway Firmware` rows on
+one device page. Renamed 2026-10-08. Unique ids are unchanged, and an existing entity keeps
+its entity id.
 """
 
 from __future__ import annotations
@@ -57,6 +63,16 @@ class _FirmwareMixin:
         raise NotImplementedError
 
     @property
+    def entity_picture(self) -> str | None:
+        """None, so the frontend shows icons rather than the integration's brand image.
+
+        `UpdateEntity` returns the brand image by default, and a picture always wins over
+        an icon. Without it the update domain's own icons apply, and they follow the state:
+        `mdi:package` when current, `mdi:package-up` when an update is available.
+        """
+        return None
+
+    @property
     def installed_version(self) -> str | None:
         return _text(self._info().get("currentFirmware"))
 
@@ -93,10 +109,10 @@ class ValveFirmwareUpdate(_FirmwareMixin, KohlerValveEntity, UpdateEntity):
         super().__init__(coordinator, valve)
         self._part = part
         if part == "gateway":
-            self._attr_name = "Gateway Firmware"
+            self._attr_name = "Gateway Firmware Status"
             self._attr_unique_id = f"{self._device_id}_gateway_firmware_update"
         else:
-            self._attr_name = "Firmware"
+            self._attr_name = "Firmware Status"
             self._attr_unique_id = f"{self._device_id}_firmware_update"
 
     def _info(self) -> dict[str, Any]:
@@ -114,7 +130,7 @@ class ValveFirmwareUpdate(_FirmwareMixin, KohlerValveEntity, UpdateEntity):
 class ControllerFirmwareUpdate(_FirmwareMixin, KohlerControllerEntity, UpdateEntity):
     """Firmware for the Anthem Plus controller (``hub``)."""
 
-    _attr_name = "Firmware"
+    _attr_name = "Firmware Status"
 
     def __init__(
         self, coordinator: KohlerAnthemCoordinator, controller: Controller

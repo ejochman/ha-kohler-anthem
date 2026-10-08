@@ -29,6 +29,12 @@ version heading and publishes it as the release's Highlights.
 
 **Changed**
 
+- **The firmware update entities are renamed `Firmware Status` and `Gateway Firmware
+  Status`** (the controller's is `Firmware Status` too), so they're no longer confused with
+  the diagnostic sensors that show the version numbers. Two entities on the valve were both
+  called `Gateway Firmware`. Existing entity IDs don't change.
+- **They show icons instead of the Kohler logo**: a package icon that changes when an update
+  is available.
 - Diagnostics: the `endless_shower` block is now `run_time`, holding the valve's run-time
   limits and how long each zone has been running. The `flowing_for_seconds` and
   `seconds_remaining` attributes are unchanged.
