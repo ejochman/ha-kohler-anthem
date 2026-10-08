@@ -9,6 +9,26 @@ Every push to `main` that passes CI is released. To choose the version, set it i
 `manifest.json` and it is released as written; leave it alone and the minor version is
 bumped (0.24 → 0.25).
 
+## Unreleased
+
+**Fixed**
+
+- **Multi-zone naming, sub-device and outlet-name modes:** an outlet switch first registered
+  by position (`Outlet 1.2`) could come back as a duplicate, leaving the original orphaned
+  with its automations. It's now moved onto its fixture name as intended, in every mode.
+- **Leaving sub-device mode no longer resets disabled entities.** Removing the zone devices
+  also removed every disabled entity still attached to them — the `Hex` sensors by default —
+  which then came back enabled and lost any rename. They're moved onto the valve first.
+
+**Changed**
+
+- The Configure dialog is translated into every language the integration ships, and says it
+  only affects valves with two zones (K-28211, K-28212).
+
+**Documentation**
+
+- The user guide explains the three multi-zone naming choices, with an example of each, and
+  no longer says there's no Configure dialog.
 
 ## 0.24 — 2026-10-08
 

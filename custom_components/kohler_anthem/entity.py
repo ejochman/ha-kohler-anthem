@@ -42,7 +42,11 @@ __all__ = [
     "KohlerControllerEntity",
     "KohlerValveEntity",
     "outlet_name",
+    "outlet_unique_id",
     "slug",
+    "valve_device_info",
+    "zone_device_id",
+    "zone_device_info",
     "zone_label",
 ]
 
@@ -50,6 +54,45 @@ __all__ = [
 def slug(name: str) -> str:
     """`Zone 2 Rainhead` -> `zone_2_rainhead`, for building a unique id from a name."""
     return "_".join(part.lower() for part in name.split())
+
+
+def valve_device_info(valve: Valve) -> DeviceInfo:
+    """The valve's own device.
+
+    One definition, because two places register it: every valve entity, and setup, which
+    registers it ahead of the platforms whenever zone sub-devices need it as their parent.
+    """
+    return DeviceInfo(
+        identifiers={(DOMAIN, valve.device_id)},
+        # "Anthem Valve" alone with one valve; suffixed with the Konnect name when there
+        # are several — see `coordinator.valve_names`.
+        name=valve.name,
+        manufacturer="Kohler",
+        # The valve's own layout — detected from the valve, else the model chosen at
+        # setup — which is what is printed on the hardware, far more useful than the API's
+        # "GCS".
+        model=valve.model.sku,
+        model_id=valve.model.name,
+        serial_number=valve.gcs_device.serial_number,
+    )
+
+
+def zone_device_id(valve: Valve, zone: int) -> str:
+    """The identifier of a zone's sub-device in `ZONE_GROUPING_SUBDEVICES` mode."""
+    return f"{valve.device_id}_zone_{zone}"
+
+
+def zone_device_info(valve: Valve, zone: int) -> DeviceInfo:
+    """One zone of a multi-zone valve as its own device, linked to the valve's."""
+    return DeviceInfo(
+        identifiers={(DOMAIN, zone_device_id(valve, zone))},
+        via_device=(DOMAIN, valve.device_id),
+        name=f"{valve.name} Zone {zone}",
+        manufacturer="Kohler",
+        model=valve.model.sku,
+        model_id=f"{valve.model.name} (Zone {zone})",
+        serial_number=valve.gcs_device.serial_number,
+    )
 
 
 def _fixture_at(valve: Valve, zone: int, position: int) -> str | None:
@@ -191,6 +234,19 @@ def outlet_name(
     return zone_label(valve, zone, fixture, grouping=ZONE_GROUPING_NUMBERED)
 
 
+def outlet_unique_id(valve: Valve, zone: int, outlet: int) -> str:
+    """An outlet switch's unique id: the valve's id plus the outlet's **numbered** name.
+
+    Fixed whatever `zone_grouping` says, so changing the mode renames an outlet switch in
+    place rather than orphaning it. Everything that builds or migrates an outlet id must
+    come through here: computing it from the *displayed* name instead gave `..._foot_sprays`
+    in the sub-device and outlet-label modes, where the switch itself registers
+    `..._foot_sprays_1`.
+    """
+    canonical = outlet_name(valve, zone, outlet, grouping=ZONE_GROUPING_NUMBERED)
+    return f"{valve.device_id}_{slug(canonical)}"
+
+
 class KohlerValveEntity(CoordinatorEntity[KohlerAnthemCoordinator]):
     """Base for entities belonging to one Anthem digital valve.
 
@@ -224,29 +280,9 @@ class KohlerValveEntity(CoordinatorEntity[KohlerAnthemCoordinator]):
             and len(valve.model.zones) > 1
             and grouping == ZONE_GROUPING_SUBDEVICES
         ):
-            self._attr_device_info = DeviceInfo(
-                identifiers={(DOMAIN, f"{valve.device_id}_zone_{zone}")},
-                via_device=(DOMAIN, valve.device_id),
-                name=f"{valve.name} Zone {zone}",
-                manufacturer="Kohler",
-                model=valve.model.sku,
-                model_id=f"{valve.model.name} (Zone {zone})",
-                serial_number=valve.gcs_device.serial_number,
-            )
+            self._attr_device_info = zone_device_info(valve, zone)
         else:
-            self._attr_device_info = DeviceInfo(
-                identifiers={(DOMAIN, valve.device_id)},
-                # "Anthem Valve" alone with one valve; suffixed with the Konnect name
-                # when there are several — see `coordinator.valve_names`.
-                name=valve.name,
-                manufacturer="Kohler",
-                # The valve's own layout — detected from the valve, else the model
-                # chosen at setup — which is what is printed on the hardware, far more
-                # useful than the API's "GCS".
-                model=valve.model.sku,
-                model_id=valve.model.name,
-                serial_number=valve.gcs_device.serial_number,
-            )
+            self._attr_device_info = valve_device_info(valve)
 
     @property
     def _state(self):

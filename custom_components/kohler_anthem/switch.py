@@ -42,13 +42,13 @@ from .const import (
     WARMUP_AUTO_RESTORE_DELAY_SECONDS,
     WARMUP_AUTO_RESTORE_NO_TARGET,
     WARMUP_AUTO_RESTORE_ON,
-    ZONE_GROUPING_NUMBERED,
 )
 from .coordinator import Controller, KohlerAnthemCoordinator, Valve
 from .entity import (
     KohlerControllerEntity,
     KohlerValveEntity,
     outlet_name,
+    outlet_unique_id,
     slug,
 )
 
@@ -124,7 +124,7 @@ def _async_migrate_outlet_unique_ids(
         return
     for zone in valve.model.zones:
         for outlet in range(1, valve.model.outlets_in_zone(zone) + 1):
-            new_id = f"{valve.device_id}_{slug(outlet_name(valve, zone, outlet))}"
+            new_id = outlet_unique_id(valve, zone, outlet)
             old_id = f"{valve.device_id}_{slug(_position_name(valve, zone, outlet))}"
             if new_id == old_id or new_id in rows or old_id not in rows:
                 continue
@@ -404,9 +404,8 @@ class ZoneOutletSwitch(KohlerValveEntity, SwitchEntity):
         # fixture is known gets `..._rainhead` (or `..._rainhead_1`) rather than
         # `..._zone_1_outlet_1`, while changing `zone_grouping` in Configure updates
         # the existing entity in place rather than orphaning it or colliding across
-        # sub-devices.
-        canonical = outlet_name(valve, zone, outlet, grouping=ZONE_GROUPING_NUMBERED)
-        self._attr_unique_id = f"{self._device_id}_{slug(canonical)}"
+        # sub-devices. See `entity.outlet_unique_id`.
+        self._attr_unique_id = outlet_unique_id(valve, zone, outlet)
         # Holds the requested position until the valve reports back. None means "no
         # pending command — show what the valve says".
         self._optimistic: bool | None = None

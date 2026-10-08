@@ -39,10 +39,19 @@
     "step": {
       "init": {
         "title": "Zone & Outlet Grouping",
-        "description": "Choose how outlets, zone controls (Temperature, Flow), and zone sensors (Shower Active, Hex) are grouped on multi-zone valves.",
+        "description": "Choose how outlets, zone controls (Temperature, Flow) and zone sensors (Shower Active, Hex) are named and grouped. This only affects valves with two zones (K-28211 and K-28212); on a single-zone valve all three options look the same.",
         "data": {
           "zone_grouping": "Zone grouping style"
         }
+      }
+    }
+  },
+  "selector": {
+    "zone_grouping": {
+      "options": {
+        "subdevices": "Sub-device per zone — separate Zone 1 / Zone 2 devices, no zone numbers on outlets or controls",
+        "outlet_labels": "Outlet names on controls — single device, e.g. Temperature (Showerhead, Body Sprays)",
+        "numbered": "Zone numbers (default) — single device, appends 1 / 2 to outlets and controls"
       }
     }
   },

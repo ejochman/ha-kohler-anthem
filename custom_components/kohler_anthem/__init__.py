@@ -29,6 +29,7 @@ from homeassistant.helpers import issue_registry as ir
 
 from .const import CONF_VALVES, DOMAIN, ZONE_GROUPING_SUBDEVICES
 from .coordinator import KohlerAnthemCoordinator, entry_reload_signature
+from .entity import valve_device_info, zone_device_id
 from .services import async_register_services, async_unregister_services
 
 _LOGGER = logging.getLogger(__name__)
@@ -191,13 +192,7 @@ def _async_ensure_parent_valve_devices(
         for valve in coordinator.valves:
             if len(valve.model.zones) > 1:
                 dev_reg.async_get_or_create(
-                    config_entry_id=entry.entry_id,
-                    identifiers={(DOMAIN, valve.device_id)},
-                    manufacturer="Kohler",
-                    name=valve.name,
-                    model=valve.model.sku,
-                    model_id=valve.model.name,
-                    serial_number=valve.gcs_device.serial_number,
+                    config_entry_id=entry.entry_id, **valve_device_info(valve)
                 )
     except Exception:
         _LOGGER.debug("Device registry unavailable during parent valve setup")
@@ -207,35 +202,55 @@ def _async_ensure_parent_valve_devices(
 def _async_cleanup_zone_subdevices(
     hass: HomeAssistant, entry: ConfigEntry, coordinator: KohlerAnthemCoordinator
 ) -> None:
-    """Remove zone sub-devices when sub-device grouping is not active."""
-    active_subdevice_ids: set[str] = set()
+    """Remove zone sub-devices that are no longer used, keeping their entities.
+
+    Removing a device also removes every entity still attached to it, and an entity the
+    platforms did not add this time is still attached: a **disabled** one is never added,
+    so it never moves back to the valve. Deleting the device outright therefore deleted
+    every disabled per-zone entity — the Hex sensors by default, and anything the owner
+    had turned off, which then came back enabled and lost its name. So each zone device's
+    remaining entities are moved onto the valve's own device first.
+    """
+    active: set[str] = set()
     if coordinator.zone_grouping == ZONE_GROUPING_SUBDEVICES:
         for valve in coordinator.valves:
             if len(valve.model.zones) > 1:
-                for zone in valve.model.zones:
-                    active_subdevice_ids.add(f"{valve.device_id}_zone_{zone}")
+                active.update(zone_device_id(valve, zone) for zone in valve.model.zones)
 
-    valve_prefixes = tuple(f"{valve.device_id}_zone_" for valve in coordinator.valves)
-    if not valve_prefixes:
+    owners = {f"{valve.device_id}_zone_": valve for valve in coordinator.valves}
+    if not owners:
         return
 
     try:
         dev_reg = dr.async_get(hass)
+        ent_reg = er.async_get(hass)
         devices = list(dr.async_entries_for_config_entry(dev_reg, entry.entry_id))
     except Exception:
         _LOGGER.debug("Device registry unavailable during zone sub-device cleanup")
         return
 
     for device in devices:
-        for domain, identifier in device.identifiers:
-            if (
-                domain == DOMAIN
-                and identifier.startswith(valve_prefixes)
-                and identifier not in active_subdevice_ids
-            ):
-                dev_reg.async_remove_device(device.id)
-                _LOGGER.info("Removed unused zone sub-device %s", device.name)
-                break
+        valve = next(
+            (
+                owner
+                for domain, identifier in device.identifiers
+                if domain == DOMAIN and identifier not in active
+                for prefix, owner in owners.items()
+                if identifier.startswith(prefix)
+            ),
+            None,
+        )
+        if valve is None:
+            continue
+        parent = dev_reg.async_get_or_create(
+            config_entry_id=entry.entry_id, **valve_device_info(valve)
+        )
+        for row in er.async_entries_for_device(
+            ent_reg, device.id, include_disabled_entities=True
+        ):
+            ent_reg.async_update_entity(row.entity_id, device_id=parent.id)
+        dev_reg.async_remove_device(device.id)
+        _LOGGER.info("Removed unused zone sub-device %s", device.name)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

@@ -35,6 +35,26 @@
       "reauth_successful": "Opnieuw verbonden."
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Groepering van zones en uitgangen",
+        "description": "Kies hoe uitgangen, zonebediening (Temperature, Flow) en zonesensoren (Shower Active, Hex) worden benoemd en gegroepeerd. Dit geldt alleen voor kleppen met twee zones (K-28211 en K-28212); bij een klep met één zone zien alle drie de opties er hetzelfde uit.",
+        "data": {
+          "zone_grouping": "Groeperingsstijl voor zones"
+        }
+      }
+    }
+  },
+  "selector": {
+    "zone_grouping": {
+      "options": {
+        "subdevices": "Subapparaat per zone — aparte apparaten voor zone 1 en zone 2, geen zonenummers bij uitgangen of bediening",
+        "outlet_labels": "Uitgangsnamen bij de bediening — één apparaat, bijv. Temperature (Showerhead, Body Sprays)",
+        "numbered": "Zonenummers (standaard) — één apparaat, voegt 1 / 2 toe aan uitgangen en bediening"
+      }
+    }
+  },
   "issues": {
     "outlet_write_unverified": {
       "title": "Een doucheinstelling is mogelijk niet toegepast",

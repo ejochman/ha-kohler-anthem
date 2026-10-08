@@ -35,6 +35,26 @@
       "reauth_successful": "Reconectado com sucesso."
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Agrupamento de zonas e saídas",
+        "description": "Escolha como as saídas, os controles de zona (Temperature, Flow) e os sensores de zona (Shower Active, Hex) são nomeados e agrupados. Isso só afeta válvulas com duas zonas (K-28211 e K-28212); em uma válvula de uma zona, as três opções ficam iguais.",
+        "data": {
+          "zone_grouping": "Estilo de agrupamento de zonas"
+        }
+      }
+    }
+  },
+  "selector": {
+    "zone_grouping": {
+      "options": {
+        "subdevices": "Um subdispositivo por zona — dispositivos separados para a zona 1 e a zona 2, sem números de zona nas saídas ou nos controles",
+        "outlet_labels": "Nomes das saídas nos controles — um único dispositivo, ex.: Temperature (Showerhead, Body Sprays)",
+        "numbered": "Números de zona (padrão) — um único dispositivo, acrescenta 1 / 2 às saídas e aos controles"
+      }
+    }
+  },
   "issues": {
     "outlet_write_unverified": {
       "title": "Uma configuração do chuveiro pode não ter sido aplicada",

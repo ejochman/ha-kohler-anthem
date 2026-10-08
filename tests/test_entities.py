@@ -3801,6 +3801,14 @@ def test_options_flow_merges_existing_options_and_reloads_on_grouping_change():
 
     flow = KohlerAnthemConfigFlow.async_get_options_flow(entry)
     assert isinstance(flow, KohlerAnthemOptionsFlow)
+    # How Home Assistant hands the flow its entry: `self.config_entry` resolves the
+    # handler (the entry id) through `hass.config_entries`.
+    flow.hass = SimpleNamespace(
+        config_entries=SimpleNamespace(
+            async_get_known_entry=lambda entry_id: entry if entry_id == "test" else None
+        )
+    )
+    flow.handler = "test"
 
     form = asyncio.run(flow.async_step_init(None))
     assert form["type"] == "form"
@@ -3832,8 +3840,13 @@ def test_options_flow_merges_existing_options_and_reloads_on_grouping_change():
 
 
 def test_zone_subdevice_cleanup_and_service_resolution(monkeypatch):
-    """Stale zone sub-devices are removed on mode switch; services accept sub-devices."""
+    """Stale zone sub-devices are removed on mode switch; services accept sub-devices.
+
+    Their entities are moved onto the valve first: removing a device removes what is still
+    attached to it, and a disabled entity — never re-added — is still attached.
+    """
     from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
 
     from custom_components.kohler_anthem import _async_cleanup_zone_subdevices
     from custom_components.kohler_anthem.anthem.models import get_valve_model
@@ -3872,6 +3885,21 @@ def test_zone_subdevice_cleanup_and_service_resolution(monkeypatch):
             removed.append(dev_id)
             self.devices.pop(dev_id, None)
 
+        def async_get_or_create(self, *, config_entry_id: str, identifiers, **_):
+            return next(
+                d for d in self.devices.values() if d.identifiers == identifiers
+            )
+
+    # The zone's Hex sensor, disabled by default and so never re-added by a platform.
+    hex_row = SimpleNamespace(
+        entity_id="sensor.anthem_valve_hex", device_id="dev-zone-1"
+    )
+
+    class FakeEntityRegistry:
+        def async_update_entity(self, entity_id: str, *, device_id: str) -> None:
+            assert entity_id == hex_row.entity_id
+            hex_row.device_id = device_id
+
     reg = FakeDeviceRegistry()
     hass = SimpleNamespace(data={"kohler_anthem": {"test": coordinator}})
     entry = SimpleNamespace(entry_id="test", data={}, options={})
@@ -3882,6 +3910,16 @@ def test_zone_subdevice_cleanup_and_service_resolution(monkeypatch):
         "async_entries_for_config_entry",
         lambda r, eid: list(r.devices.values()),
     )
+    monkeypatch.setattr(er, "async_get", lambda h: FakeEntityRegistry())
+    monkeypatch.setattr(
+        er,
+        "async_entries_for_device",
+        lambda r, dev_id, include_disabled_entities=False: (
+            [hex_row]
+            if dev_id == hex_row.device_id and include_disabled_entities
+            else []
+        ),
+    )
 
     assert _resolve_valve(hass, "dev-zone-1") is valve
 
@@ -3889,8 +3927,36 @@ def test_zone_subdevice_cleanup_and_service_resolution(monkeypatch):
     _async_cleanup_zone_subdevices(hass, entry, coordinator)
     assert removed == []
 
-    # Switching back to `numbered` removes the zone sub-device.
+    # Switching back to `numbered` removes the zone sub-device...
     coordinator.zone_grouping = ZONE_GROUPING_NUMBERED
     _async_cleanup_zone_subdevices(hass, entry, coordinator)
     assert removed == ["dev-zone-1"]
     assert "dev-parent" in reg.devices
+    # ...after moving its disabled entity onto the valve, so it survives the removal.
+    assert hex_row.device_id == "dev-parent"
+
+
+def test_zone_grouping_choices_are_translated_in_every_language():
+    """The three choices are translation keys, with text in every language the repo ships."""
+    import json
+    import pathlib
+
+    from custom_components.kohler_anthem.config_flow import _options_schema
+    from custom_components.kohler_anthem.const import ZONE_GROUPING_MODES
+
+    selector = next(iter(_options_schema("numbered").schema.values()))
+    assert selector.config["translation_key"] == "zone_grouping"
+    assert set(selector.config["options"]) == set(ZONE_GROUPING_MODES)
+
+    root = pathlib.Path("custom_components/kohler_anthem")
+    for path in [
+        root / "strings.json",
+        *sorted((root / "translations").glob("*.json")),
+    ]:
+        strings = json.loads(path.read_text(encoding="utf-8"))
+        options = strings["selector"]["zone_grouping"]["options"]
+        assert set(options) == set(ZONE_GROUPING_MODES), path
+        step = strings["options"]["step"]["init"]
+        assert {"title", "description", "data"} <= set(step), path
+        # Says who it is for, so a single-zone owner knows it does nothing for them.
+        assert "K-28211" in step["description"], path

@@ -103,6 +103,48 @@ def test_a_position_named_outlet_moves_to_its_fixture_id_keeping_its_entity_id(
     ]
 
 
+@pytest.mark.parametrize("mode", ["numbered", "subdevices", "outlet_labels"])
+def test_the_migration_lands_on_the_id_the_switch_registers_in_every_mode(
+    monkeypatch, mode
+):
+    """The migration and the switch must agree on the id, whatever `zone_grouping` says.
+
+    The migration used the *displayed* name, which drops the zone number in the sub-device
+    and outlet-label modes: it moved the row to `..._foot_sprays` while the switch
+    registered `..._foot_sprays_1`, orphaning the entity it meant to keep.
+    """
+    from custom_components.kohler_anthem import switch as module
+
+    valve = make_valve(
+        _model("K-28212"),
+        [11, 62, 31, 1, 52, 21],
+        device_id="gcs-x",
+        zone_grouping=mode,
+    )
+    updates: list = []
+    registry = SimpleNamespace(
+        rows=[
+            SimpleNamespace(
+                unique_id="gcs-x_outlet_1.2",
+                entity_id="switch.anthem_valve_outlet_1_2",
+                domain="switch",
+            )
+        ],
+        async_update_entity=lambda entity_id, new_unique_id: updates.append(
+            new_unique_id
+        ),
+    )
+    monkeypatch.setattr(module.er, "async_get", lambda hass: registry)
+    monkeypatch.setattr(
+        module.er, "async_entries_for_config_entry", lambda reg, entry_id: reg.rows
+    )
+    module._async_migrate_outlet_unique_ids(
+        SimpleNamespace(), SimpleNamespace(entry_id="e"), valve
+    )
+    switch = module.ZoneOutletSwitch(make_coordinator([valve]), valve, 1, 2)
+    assert updates == [switch.unique_id] == ["gcs-x_foot_sprays_1"]
+
+
 # --------------------------------------------------------------------------- #
 # Status codes
 # --------------------------------------------------------------------------- #

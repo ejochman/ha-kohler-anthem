@@ -35,6 +35,26 @@
       "reauth_successful": "Reconnexion réussie."
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Regroupement des zones et des sorties",
+        "description": "Choisissez comment les sorties, les commandes de zone (Temperature, Flow) et les capteurs de zone (Shower Active, Hex) sont nommés et regroupés. Cela ne concerne que les vannes à deux zones (K-28211 et K-28212) ; sur une vanne à une seule zone, les trois options donnent le même résultat.",
+        "data": {
+          "zone_grouping": "Style de regroupement des zones"
+        }
+      }
+    }
+  },
+  "selector": {
+    "zone_grouping": {
+      "options": {
+        "subdevices": "Un sous-appareil par zone — appareils distincts pour la zone 1 et la zone 2, sans numéro de zone sur les sorties ni les commandes",
+        "outlet_labels": "Noms des sorties sur les commandes — un seul appareil, p. ex. Temperature (Showerhead, Body Sprays)",
+        "numbered": "Numéros de zone (par défaut) — un seul appareil, ajoute 1 / 2 aux sorties et aux commandes"
+      }
+    }
+  },
   "issues": {
     "outlet_write_unverified": {
       "title": "Un réglage de la douche n'a peut-être pas été appliqué",

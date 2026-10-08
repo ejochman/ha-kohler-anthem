@@ -168,6 +168,34 @@ outlets of the same fixture, the fixture takes its own number too — `Showerhea
 showerhead in zone 1). An outlet whose type the valve hasn't reported falls back to its
 position: `Outlet 1`, or `Outlet 2.1` on a multi-zone valve.
 
+### Multi-zone naming
+
+On a valve with two zones — K-28211 and K-28212 — you can choose how each zone's entities are
+grouped and named: **Settings → Devices & services → Kohler Anthem → Configure**. On a
+single-zone valve the three choices look the same, so there's nothing to change.
+
+Taking a K-28211 with a showerhead and body sprays on zone 1, and a rainhead and handshower on
+zone 2:
+
+| | Zone numbers (default) | Sub-device per zone | Outlet names on controls |
+|---|---|---|---|
+| Devices | `Anthem Valve` | `Anthem Valve`, plus `Anthem Valve Zone 1` and `Anthem Valve Zone 2` | `Anthem Valve` |
+| Outlet switches | `Showerhead 1`, `Rainhead 2` | `Showerhead`, `Rainhead`, each on its zone's device | `Showerhead`, `Rainhead` |
+| Temperature and Flow | `Temperature 1`, `Flow 2` | `Temperature`, `Flow`, on each zone's device | `Temperature (Showerhead, Body Sprays)` |
+| Whether a zone is running | `Shower Active 1` | `Zone Active`, on each zone's device | `Zone Active (Rainhead, Handshower)` |
+| Command word | `Hex 1` | `Hex`, on each zone's device | `Hex (Showerhead, Body Sprays)` |
+
+* **With outlet names on controls**, an outlet switch keeps its zone number only when both
+  zones have that fixture (`Showerhead 1`, `Showerhead 2`). A zone whose outlet types the
+  valve hasn't reported yet falls back to its number.
+* **With a sub-device per zone**, everything that belongs to the whole valve — `Shower on`,
+  `Favorite`, `Warmup`, `System Status`, the settings — stays on `Anthem Valve`. Give each zone
+  device its own area if the zones are in different places.
+* **Changing the choice renames entities but keeps their entity IDs**, so automations and
+  dashboards keep working. Home Assistant reloads the integration to apply it. Switching away
+  from sub-devices moves every entity back onto `Anthem Valve`, including disabled ones, and
+  removes the zone devices.
+
 ### Anthem valve
 
 | Entity | Type | What it does |
@@ -286,10 +314,10 @@ warmup off; `Warmup Auto-Restore`, if it's on, puts it back.
 | `Last Update` | both | Timestamp of the most recent message |
 | `Start new MQTT capture` | both | Button; rolls the raw capture over to a fresh file |
 | `Report Log` | both | Switch; one-file bug-report capture of the raw MQTT stream — see [Diagnostics](#diagnostics) |
-| `Hex` | valve | The current command word for that zone — copy it into `send_valve_hex`. `Zone N Hex` on a two-zone valve |
+| `Hex` | valve | The current command word for that zone — copy it into `send_valve_hex`. `Hex 1` / `Hex 2` on a two-zone valve; see [Multi-zone naming](#multi-zone-naming) |
 | `Water Used Today` | valve | Water used since local midnight, from Kohler's own per-day usage series — the same data behind the app's chart. Refreshed about 90 seconds after a shower ends, not on a clock |
 | `Water Used This Week` | valve | The last seven days including today, as a rolling window — **not a calendar week**. Summed from seven daily buckets; `per_day` carries the breakdown |
-| `Shower Active N` | valve | Whether that zone is currently running water. **Multi-zone valves only** — with one zone `System Status` answers the same question and more, so no such entity is created |
+| `Shower Active N` | valve | Whether that zone is currently running water. **Multi-zone valves only** — with one zone `System Status` answers the same question and more, so no such entity is created. `Zone Active` with the other [naming choices](#multi-zone-naming) |
 | `Preset Active` | valve | Whether a stored preset is driving the valve |
 | `Interface Firmware` | valve | The touchscreen's own version — what the Konnect app calls the interface firmware |
 | `Valve Firmware` | valve | The valve's own version |
@@ -521,7 +549,7 @@ rest.
 
 The workflow is copy-and-paste rather than hand-assembly. Set the shower up the way you want
 it using the outlet switches and temperature controls, read the resulting code off the
-`Hex` diagnostic sensor (`Zone N Hex` on a two-zone valve), and store that string. Sending it later reproduces that exact
+`Hex` diagnostic sensor (`Hex 1` / `Hex 2` on a two-zone valve), and store that string. Sending it later reproduces that exact
 state.
 
 ```yaml
@@ -672,9 +700,11 @@ Assistant.
 Temperature and water units are read from your Konnect account, not chosen here — set them in
 the Konnect app and they follow.
 
-There is no Configure dialog — every setting that can change after setup is an entity on the
-device page (`Warmup`, `Max Shower Duration` and — where an Anthem Plus controller is
-present — `Warmup Auto-Restore`), where automations and dashboards can reach it too.
+**Configure** has one setting: how a two-zone valve's entities are named and grouped — see
+[Multi-zone naming](#multi-zone-naming). Every other setting that can change after setup is
+an entity on the device page (`Warmup`, `Max Shower Duration` and — where an Anthem Plus
+controller is present — `Warmup Auto-Restore`), where automations and dashboards can reach it
+too.
 
 ### Diagnostics
 

@@ -35,6 +35,26 @@
       "reauth_successful": "Erfolgreich wieder verbunden."
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Zonen- und Auslassgruppierung",
+        "description": "Lege fest, wie Auslässe, Zonensteuerungen (Temperature, Flow) und Zonensensoren (Shower Active, Hex) benannt und gruppiert werden. Das betrifft nur Armaturen mit zwei Zonen (K-28211 und K-28212); bei einer Armatur mit einer Zone sehen alle drei Optionen gleich aus.",
+        "data": {
+          "zone_grouping": "Gruppierung der Zonen"
+        }
+      }
+    }
+  },
+  "selector": {
+    "zone_grouping": {
+      "options": {
+        "subdevices": "Eigenes Gerät pro Zone — getrennte Geräte für Zone 1 und Zone 2, keine Zonennummern an Auslässen oder Steuerungen",
+        "outlet_labels": "Auslassnamen an den Steuerungen — ein Gerät, z. B. Temperature (Showerhead, Body Sprays)",
+        "numbered": "Zonennummern (Standard) — ein Gerät, hängt 1 / 2 an Auslässe und Steuerungen an"
+      }
+    }
+  },
   "issues": {
     "outlet_write_unverified": {
       "title": "Eine Duscheinstellung wurde möglicherweise nicht angewendet",

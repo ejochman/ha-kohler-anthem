@@ -96,34 +96,23 @@ def _valve_schema() -> vol.Schema:
 
 
 def _options_schema(current_grouping: str) -> vol.Schema:
-    """Selector for multi-zone outlet and control grouping."""
-    options = [
-        SelectOptionDict(
-            value=ZONE_GROUPING_SUBDEVICES,
-            label=(
-                "Sub-device per zone — separate Zone 1 / Zone 2 devices, "
-                "no zone numbers on outlets or controls"
-            ),
-        ),
-        SelectOptionDict(
-            value=ZONE_GROUPING_OUTLET_LABELS,
-            label=(
-                "Outlet names on controls — single device, e.g. "
-                "Temperature (Showerhead, Body Sprays)"
-            ),
-        ),
-        SelectOptionDict(
-            value=ZONE_GROUPING_NUMBERED,
-            label=(
-                "Zone numbers (default) — single device, appends 1 / 2 "
-                "to outlets and controls"
-            ),
-        ),
-    ]
+    """Selector for multi-zone outlet and control grouping.
+
+    The choices' labels live in `strings.json` under `selector.zone_grouping`, so they
+    are translated like the rest of the dialog.
+    """
     return vol.Schema(
         {
             vol.Required(CONF_ZONE_GROUPING, default=current_grouping): SelectSelector(
-                SelectSelectorConfig(options=options, mode=SelectSelectorMode.LIST)
+                SelectSelectorConfig(
+                    options=[
+                        ZONE_GROUPING_SUBDEVICES,
+                        ZONE_GROUPING_OUTLET_LABELS,
+                        ZONE_GROUPING_NUMBERED,
+                    ],
+                    mode=SelectSelectorMode.LIST,
+                    translation_key=CONF_ZONE_GROUPING,
+                )
             )
         }
     )
@@ -140,7 +129,7 @@ class KohlerAnthemConfigFlow(ConfigFlow, domain=DOMAIN):
         config_entry: ConfigEntry,
     ) -> KohlerAnthemOptionsFlow:
         """Return the options flow for this handler."""
-        return KohlerAnthemOptionsFlow(config_entry)
+        return KohlerAnthemOptionsFlow()
 
     # Attribute names are deliberately prefixed. Home Assistant's ConfigFlow base class
     # defines read-only properties such as `_reauth_entry_id`, and assigning to one raises
@@ -342,20 +331,11 @@ class KohlerAnthemConfigFlow(ConfigFlow, domain=DOMAIN):
 class KohlerAnthemOptionsFlow(OptionsFlow):
     """Configure display options for Kohler Anthem."""
 
-    def __init__(self, config_entry: ConfigEntry | None = None) -> None:
-        self._entry = config_entry
-
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Manage how multi-zone outlets, controls, and sensors are grouped."""
-        entry = self._entry
-        if entry is None:
-            try:
-                entry = self.config_entry
-            except (AttributeError, ValueError):
-                entry = None
-        existing_options = dict(entry.options) if entry is not None else {}
+        existing_options = dict(self.config_entry.options)
 
         if user_input is not None:
             # Merge with `existing_options` rather than replacing wholesale:
