@@ -5,7 +5,7 @@ Notable changes for each tagged release. Versions correspond to git tags and to 
 **Unreleased** as part of each change; the release workflow rotates that section into a
 version heading and publishes it as the release's Highlights.
 
-## Unreleased
+## 0.20 — 2026-10-08
 
 Built from a decompile of the Kohler Konnect Android app, version 3.0.6. It settled most of
 the protocol questions this integration had left open, and showed where the integration
