@@ -75,6 +75,40 @@ def _usage_bucket_date(interval: object) -> date | None:
         return None
 
 
+def _daily_month_rollup(
+    usage_daily: dict[str, Any] | None, month: str
+) -> tuple[float, float | None] | None:
+    """Sum `volume` (litres) and `onDuration` (seconds) for `month` from `usage_daily`.
+
+    `usage_daily` covers the trailing 35 days (`Interval=DAY`) and is refreshed whenever a
+    shower ends, so it always holds every day of the current calendar month (max 31 days).
+    Using it to keep the current month's bucket live updates both `Water Used This Month`
+    and `Water Used This Year` after every shower without a second `gcs-usage` request.
+    """
+    if not isinstance(usage_daily, dict):
+        return None
+    prefix = f"{month}-"
+    total_volume = 0.0
+    total_duration = 0.0
+    has_volume = False
+    has_duration = False
+    for entry in usage_series(usage_daily):
+        interval = entry.get("intervalKey")
+        if not isinstance(interval, str) or not interval.startswith(prefix):
+            continue
+        volume = entry.get("volume")
+        if isinstance(volume, (int, float)):
+            total_volume += float(volume)
+            has_volume = True
+        duration = entry.get("onDuration")
+        if isinstance(duration, (int, float)):
+            total_duration += float(duration)
+            has_duration = True
+    if not has_volume:
+        return None
+    return total_volume, (total_duration if has_duration else None)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -347,16 +381,14 @@ class ValveMonthlyWaterSensor(KohlerValveEntity, SensorEntity):
     """Water used in the current calendar month, from Kohler's own usage history.
 
     **This is the number the Konnect app charts**, not a figure derived from the lifetime
-    counter. It comes from `gcs-usage`, whose per-month series the app reads and which no
-    other integration calls — its query parameters are PascalCase where the rest of the API
-    is camelCase, so it answers a generic 400 to anything else and had gone unsolved.
+    counter. It comes from `gcs-usage`, whose per-month series is seeded at startup and
+    whose per-day series (`Interval=DAY`, trailing 35 days) is refreshed whenever a shower
+    ends — keeping the current month's total live after every shower with no extra API call.
 
     `volume` arrives in **litres** whatever the account's unit setting; the app converts with
     0.264172 when `waterUnits` is `Standard`, and this follows that exactly so the value
     matches the app rather than merely being close.
 
-    **Read once at setup, not polled.** A monthly total moves slowly and Kohler's own chart
-    is not live either, so this refreshes when Home Assistant restarts or the entry reloads.
     `TOTAL` rather than `TOTAL_INCREASING`: the figure resets each month by design, and
     telling Home Assistant otherwise would make every month boundary look like a meter swap.
     """
@@ -369,15 +401,10 @@ class ValveMonthlyWaterSensor(KohlerValveEntity, SensorEntity):
     def __init__(self, coordinator: KohlerAnthemCoordinator, valve: Valve) -> None:
         super().__init__(coordinator, valve)
         self._attr_unique_id = f"{self._device_id}_water_this_month"
-        # **Rendered once, not per message.** Every MQTT message re-renders every entity, and
-        # this one's attributes are a 13-month dict built from data read once at setup and
-        # never again. Recomputing it per message cost two linear scans, two `strftime` calls
-        # and thirteen conversions — and, because attributes are serialised into the state
-        # machine and the recorder, wrote that churn to the database on every message.
-        #
-        # Keyed on the identity of the usage payload, so a re-seed that replaces it
-        # invalidates the cache without needing an explicit hook.
-        self._cache_key: int | None = None
+        # **Rendered once per usage update, not per MQTT message.** Keyed on the identity of
+        # both usage payloads plus the calendar month so post-shower `usage_daily` refreshes
+        # and month rollovers invalidate the cache automatically.
+        self._cache_key: tuple[int, int, str] | None = None
         self._cached: tuple[dict[str, Any] | None, dict[str, Any]] = (None, {})
 
     @property
@@ -393,26 +420,45 @@ class ValveMonthlyWaterSensor(KohlerValveEntity, SensorEntity):
 
         The month is matched on `intervalKey` rather than taken as the last entry: the series
         can end on a month the valve reported nothing for, and trusting position would then
-        publish a stale month's total as the current one.
+        publish a stale month's total as the current one. When `usage_daily` has newer buckets
+        for the current month from a finished shower, its rollup keeps this month's figure and
+        running duration current without re-fetching `Interval=MONTH`.
         """
         usage = self._valve.usage
-        key = id(usage)
+        usage_daily = getattr(self._valve, "usage_daily", None)
+        month = dt_util.now().strftime("%Y-%m")
+        key = (id(usage), id(usage_daily), month)
         if key == self._cache_key:
             return self._cached
 
         entries = usage_series(usage)
-        month = datetime.now(UTC).strftime("%Y-%m")
         current = next(
             (entry for entry in entries if entry.get("intervalKey") == month), None
         )
+        daily = _daily_month_rollup(usage_daily, month)
+        if daily is not None:
+            daily_volume, daily_duration = daily
+            monthly_vol = None if current is None else current.get("volume")
+            if not isinstance(monthly_vol, (int, float)) or daily_volume >= float(
+                monthly_vol
+            ):
+                current = (
+                    dict(current) if current is not None else {"intervalKey": month}
+                )
+                current["volume"] = daily_volume
+                if daily_duration is not None:
+                    current["onDuration"] = daily_duration
 
         attributes: dict[str, Any] = {}
-        if entries:
-            attributes["history"] = {
-                str(entry.get("intervalKey")): self._volume(entry)
-                for entry in entries
-                if entry.get("intervalKey")
-            }
+        history: dict[str, float | None] = {
+            str(entry.get("intervalKey")): self._volume(entry)
+            for entry in entries
+            if entry.get("intervalKey")
+        }
+        if current is not None:
+            history[month] = self._volume(current)
+        if history:
+            attributes["history"] = history
         if current is not None:
             attributes["month"] = current.get("intervalKey")
             duration = current.get("onDuration")
@@ -461,43 +507,29 @@ class ValveDiagnosticSensor(KohlerValveEntity, SensorEntity):
 
 
 class ValveYearlyWaterSensor(KohlerValveEntity, SensorEntity):
-    """Water used over the last twelve complete months, from Kohler's own usage history.
+    """Water used in the current calendar year (Jan 1 – today), from Kohler's usage history.
 
-    **The way out of the lifetime-counter problem.** The valve's `totalVolume` is a real
-    meter — an isolated 2.4 gallon session moved it by 19 counts, so it counts eighths of a
-    US gallon — but its absolute value is around 537 million, which at that unit would be 67
-    million gallons and cannot be what it claims. Something else is packed into the field and
-    nobody has established what, so a lifetime total derived from it would be a guess.
+    **Matches the Konnect app's Year tab (`Jan 1` – `Dec 31`, clamped to today)** as well as
+    `Water Used Today` and `Water Used This Month`. Prior months in the calendar year come
+    from the `Interval=MONTH` series seeded at startup, while the current month's bucket is
+    kept live from the `Interval=DAY` series refreshed whenever a shower ends — so every
+    shower updates this sensor alongside the daily, weekly, and monthly totals without an
+    extra API call.
 
-    This needs none of that. `gcs-usage` returns a per-month series in **litres**, which is
-    the same data the Konnect app charts, and summing twelve of its entries is arithmetic on
-    values whose unit is already settled. A year is not a lifetime, but it is a real number
-    that matches the app — which a wrong lifetime figure would not be.
-
-    **Complete months only.** The current partial month is excluded, so the value does not
-    creep upward through the month and then drop when the window rolls: it changes once, at a
-    month boundary, which is what `TOTAL` means. `Water Used This Month` covers the partial
-    month beside it.
-
-    Read once at setup with the rest of the usage series — no extra API call, and no polling.
+    `TOTAL`, not `TOTAL_INCREASING`: the figure resets on January 1 by design, and calling
+    that a meter reset would inject a phantom year of water into long-term statistics.
     """
 
     _attr_name = "Water Used This Year"
     _attr_icon = "mdi:calendar-range"
     _attr_device_class = SensorDeviceClass.WATER
-    # `TOTAL`, not `TOTAL_INCREASING`: a rolling window falls whenever the month dropping off
-    # the back was wetter than the one joining, and calling that a meter reset would inject a
-    # phantom year of water into long-term statistics.
     _attr_state_class = SensorStateClass.TOTAL
     _attr_entity_registry_enabled_default = True
 
     def __init__(self, coordinator: KohlerAnthemCoordinator, valve: Valve) -> None:
         super().__init__(coordinator, valve)
         self._attr_unique_id = f"{self._device_id}_water_this_year"
-        # Cached on the payload's identity, exactly as the monthly sensor is: every MQTT
-        # message re-renders every entity, and this sums a 13-entry series that changes only
-        # when the entry reloads.
-        self._cache_key: int | None = None
+        self._cache_key: tuple[int, int, str] | None = None
         self._cached: tuple[float | None, dict[str, Any]] = (None, {})
 
     @property
@@ -510,35 +542,56 @@ class ValveYearlyWaterSensor(KohlerValveEntity, SensorEntity):
 
     def _rendered(self) -> tuple[float | None, dict[str, Any]]:
         usage = self._valve.usage
-        key = id(usage)
+        usage_daily = getattr(self._valve, "usage_daily", None)
+        this_month = dt_util.now().strftime("%Y-%m")
+        this_year = this_month[:4]
+        key = (id(usage), id(usage_daily), this_month)
         if key == self._cache_key:
             return self._cached
 
-        this_month = datetime.now(UTC).strftime("%Y-%m")
+        year_prefix = f"{this_year}-"
         months: dict[str, float] = {}
         for entry in usage_series(usage):
             interval = entry.get("intervalKey")
-            # The current month is deliberately excluded — see the class docstring.
-            if not interval or str(interval) >= this_month:
+            if (
+                not isinstance(interval, str)
+                or not interval.startswith(year_prefix)
+                or interval > this_month
+            ):
                 continue
             litres = entry.get("volume")
             if isinstance(litres, (int, float)):
-                months[str(interval)] = float(litres)
+                months[interval] = float(litres)
+
+        daily = _daily_month_rollup(usage_daily, this_month)
+        if daily is not None:
+            daily_volume, _ = daily
+            if daily_volume >= months.get(this_month, 0.0):
+                months[this_month] = daily_volume
 
         total: float | None = None
         attributes: dict[str, Any] = {}
         if months:
-            # The twelve most recent complete months. Fewer where the account is younger, and
-            # `months_counted` says so rather than letting a short series read as a low year.
-            recent = sorted(months)[-12:]
-            litres = sum(months[key_] for key_ in recent)
+            ordered = sorted(months)
+            litres = sum(months[key_] for key_ in ordered)
             value = litres if self._metric else usage_volume_gallons(litres)
             total = round(value, 1)
             attributes = {
-                "months_counted": len(recent),
-                "first_month": recent[0],
-                "last_month": recent[-1],
-                "excludes_current_month": this_month,
+                "year": this_year,
+                "months_counted": len(ordered),
+                "first_month": ordered[0],
+                "last_month": ordered[-1],
+                "per_month": {
+                    key_: round(
+                        (
+                            months[key_]
+                            if self._metric
+                            else usage_volume_gallons(months[key_])
+                        ),
+                        1,
+                    )
+                    for key_ in ordered
+                },
             }
 
         self._cache_key = key
@@ -675,6 +728,14 @@ class _DailyWaterSensor(KohlerValveEntity, SensorEntity):
                 # The per-day breakdown is the point of a rolling window: it says which day
                 # the water went, which a single figure cannot.
                 attributes["per_day"] = dict(sorted(days.items()))
+                attributes["window_days"] = self._days
+        elif volumes:
+            # A valid daily series is present from Kohler, and no bucket exists in the
+            # requested window yet (e.g. after midnight before the day's first shower).
+            total = 0.0
+            attributes = {"days_counted": 0}
+            if self._days > 1:
+                attributes["per_day"] = {}
                 attributes["window_days"] = self._days
 
         self._cache_key = key

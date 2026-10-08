@@ -90,6 +90,12 @@ SCAN_INTERVAL = None
 # running -> stopped edge, so a day with no shower costs no calls at all.
 USAGE_REFRESH_DELAY_SECONDS = 90
 
+# Conditional follow-up wait when the first read at `USAGE_REFRESH_DELAY_SECONDS` returns
+# the exact same daily total as before the shower — i.e. Kohler's cloud backend had not
+# finished aggregating the session at 90 s. Never runs when the 90 s read already shows
+# the new water.
+USAGE_RETRY_DELAY_SECONDS = 180
+
 # How long to wait after writing an outlet configuration before reading it back.
 #
 # ⚠️ **An immediate read-back lies.** `gcsadvancestate` is a cloud document that only updates

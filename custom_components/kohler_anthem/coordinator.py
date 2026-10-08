@@ -37,8 +37,12 @@ from homeassistant.exceptions import (
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import (
+    async_track_time_change,
+    async_track_time_interval,
+)
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .anthem import (
     MSG_GCS_SOLO_STATUS,
@@ -72,7 +76,7 @@ from .anthem import (
     unit_to_celsius,
 )
 from .anthem.entry_reload import reload_signature
-from .anthem.state import outlet_limits_from_settings
+from .anthem.state import outlet_limits_from_settings, usage_series
 from .anthem.valve_hex import (
     TEMPERATURE_MAX_TENTHS,
     TEMPERATURE_TENTHS_PER_DEGREE,
@@ -120,6 +124,7 @@ from .const import (
     SCAN_INTERVAL,
     SYNC_DEFAULT_PRESET_TIMER,
     USAGE_REFRESH_DELAY_SECONDS,
+    USAGE_RETRY_DELAY_SECONDS,
     WARMUP_CONTEXT_AFTER_SECONDS,
     WARMUP_CONTEXT_BEFORE_SECONDS,
     WARMUP_CONTEXT_MAX_MESSAGES,
@@ -129,6 +134,19 @@ from .const import (
 from .warmup_manager import WarmupManager
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _daily_usage_volumes(payload: dict[str, Any] | None) -> dict[str, float]:
+    """Per-day volume map (`YYYY-MM-DD -> litres`) from a `gcs-usage` payload."""
+    if not isinstance(payload, dict):
+        return {}
+    volumes: dict[str, float] = {}
+    for entry in usage_series(payload):
+        key = str(entry.get("intervalKey") or "")
+        vol = entry.get("volume")
+        if key and isinstance(vol, (int, float)):
+            volumes[key] = float(vol)
+    return volumes
 
 
 #: Keys that hold the version a device is *running*, in the two nested blocks Kohler uses.
@@ -582,10 +600,10 @@ class Valve:
         #: `{currentFirmware, firmware, firmwareUpdateAvailable, mandatoryUpdate, ...}`.
         #: Refreshed twice a day — see `KohlerAnthemCoordinator.async_refresh_firmware`.
         self.firmware_info: dict[str, dict[str, Any]] = {}
-        #: The most recent `gcs-usage` response, or {} when the read failed. Refreshed on
-        #: the seed only — a monthly series does not change between reconnects, and this is
-        #: a diagnostic rather than something an automation waits on.
+        #: The most recent `gcs-usage` response, or {} when the read failed. Seeded at
+        #: startup and refreshed once when a calendar month boundary rolls over.
         self.usage: dict[str, Any] = {}
+        self._usage_seeded_month: str | None = None
         # The per-day series, refreshed when a shower ends — see `async_refresh_daily_usage`.
         self.usage_daily: dict[str, Any] = {}
         # Guards the refresh against a burst of stop-messages: the valve sends several as a
@@ -871,11 +889,18 @@ class Valve:
 
         Fires on the running -> stopped edge only. The valve sends several messages as a
         shower winds down and the running flag can flicker, so `_daily_usage_task` makes a
-        second edge a no-op while the first read is still in flight.
+        second edge a no-op while the first read is still in flight; if water starts running
+        again before the delayed read fires, the pending task is cancelled so the read waits
+        until the session actually ends.
         """
         running = self.gcs_state.is_running
         was_running, self._was_running = self._was_running, running
-        if running or not was_running:
+        if running:
+            if self._daily_usage_task is not None and not self._daily_usage_task.done():
+                self._daily_usage_task.cancel()
+            self._daily_usage_task = None
+            return
+        if not was_running:
             return
         if self._daily_usage_task is not None and not self._daily_usage_task.done():
             return
@@ -887,16 +912,45 @@ class Valve:
         The delay is not politeness: the cloud aggregates a session after the valve reports
         it closed, so reading the instant the water stops returns the total *without* the
         shower that just happened — the one reading a user would check.
+
+        If the first read at `USAGE_REFRESH_DELAY_SECONDS` returns the exact same daily
+        total as before (cloud aggregation lagged past 90 s), one follow-up read runs after
+        `USAGE_RETRY_DELAY_SECONDS`. When the first read already reflects the new water —
+        or when no baseline was seeded yet — no extra request is made.
         """
+        usage_daily = getattr(self, "usage_daily", None)
+        had_baseline = bool(isinstance(usage_daily, dict) and usage_series(usage_daily))
+        baseline = _daily_usage_volumes(usage_daily)
+
         await asyncio.sleep(USAGE_REFRESH_DELAY_SECONDS)
+        if self.gcs_state.is_running:
+            return
         try:
             await self.async_refresh_daily_usage()
-        except (
-            KohlerError
-        ) as err:  # pragma: no cover - async_get_usage swallows its own
+        except (AuthError, KohlerError) as err:
             _LOGGER.debug("Could not refresh daily usage: %s", err)
+            if credential_is_dead(err):
+                self.coordinator._handle_auth_error(err)
             return
         # Entities read `usage_daily` directly; this is what re-renders them.
+        self.coordinator.async_refresh_entities()
+
+        if not had_baseline:
+            return
+        fresh = _daily_usage_volumes(getattr(self, "usage_daily", None))
+        if any(vol > baseline.get(day, 0.0) for day, vol in fresh.items()):
+            return
+
+        await asyncio.sleep(USAGE_RETRY_DELAY_SECONDS)
+        if self.gcs_state.is_running:
+            return
+        try:
+            await self.async_refresh_daily_usage()
+        except (AuthError, KohlerError) as err:
+            _LOGGER.debug("Could not refresh daily usage on retry: %s", err)
+            if credential_is_dead(err):
+                self.coordinator._handle_auth_error(err)
+            return
         self.coordinator.async_refresh_entities()
 
     def forget_timings(self) -> None:
@@ -1175,15 +1229,6 @@ class Valve:
         # than raising, so this needs no guard of its own.
         # The two series are independent of each other, so they overlap rather than
         # queueing — the same reasoning as `_seed_independent_reads` one level up.
-        now = datetime.now(UTC)
-
-        async def _monthly() -> None:
-            self.usage = await self.client.async_get_usage(
-                self.gcs_device.device_id,
-                from_date=(now - timedelta(days=400)).date().isoformat(),
-                to_date=now.date().isoformat(),
-            )
-
         async def _about() -> None:
             # Per-part serials and models, for the device registry and diagnostics. Answers
             # {} on failure by contract, so it needs no guard — and it overlaps the usage
@@ -1193,7 +1238,27 @@ class Valve:
                 self.gcs_device.device_id
             )
 
-        await asyncio.gather(_monthly(), self.async_refresh_daily_usage(), _about())
+        await asyncio.gather(
+            self.async_refresh_monthly_usage(),
+            self.async_refresh_daily_usage(),
+            _about(),
+        )
+
+    async def async_refresh_monthly_usage(self) -> None:
+        """Read the per-month usage series (`Interval=MONTH`, 400 days back)."""
+        now = datetime.now(UTC)
+        fresh = await self.client.async_get_usage(
+            self.gcs_device.device_id,
+            from_date=(now - timedelta(days=400)).date().isoformat(),
+            to_date=now.date().isoformat(),
+        )
+        # `async_get_usage` returns `{}` on a transient HTTP failure; only overwrite
+        # `self.usage` when the read succeeds (or on cold start when nothing is held yet),
+        # so a transient failure on month rollover never drops prior months from memory.
+        if fresh or not getattr(self, "usage", None):
+            self.usage = fresh
+        if fresh:
+            self._usage_seeded_month = dt_util.now().strftime("%Y-%m")
 
     async def async_refresh_daily_usage(self) -> None:
         """Read the per-day usage series — `Interval=DAY`, verified working 2026-09-11.
@@ -1212,12 +1277,22 @@ class Valve:
         slack so a restart never renders the week short.
         """
         now = datetime.now(UTC)
-        self.usage_daily = await self.client.async_get_usage(
+        fresh = await self.client.async_get_usage(
             self.gcs_device.device_id,
             from_date=(now - timedelta(days=35)).date().isoformat(),
             to_date=now.date().isoformat(),
             interval="DAY",
         )
+        # Keep the prior daily series if a post-shower read transiently returns `{}`, so
+        # `Water Used Today` and `Water Used This Week` do not blank to `unknown`.
+        if fresh or not getattr(self, "usage_daily", None):
+            self.usage_daily = fresh
+        # When a shower ends in a new local calendar month after initial seed, re-read the
+        # monthly series once so the newly completed month is locked into `self.usage`
+        # before the 35-day daily window rolls past its start.
+        seeded_month = getattr(self, "_usage_seeded_month", None)
+        if seeded_month is not None and dt_util.now().strftime("%Y-%m") != seeded_month:
+            await self.async_refresh_monthly_usage()
 
     async def _async_seed_presets(self) -> None:
         """Seed the preset slots. Independent of topology — see `_seed_independent_reads`."""
@@ -1307,6 +1382,8 @@ class Valve:
                 )
             was_warmup = self.gcs_state.warmup_mode
             self.gcs_state.apply_rest_state(payload)
+            if hasattr(self, "_was_running") and hasattr(self.gcs_state, "is_running"):
+                self._note_running_for_usage()
             # Warm-up gets its own call rather than thirty lines here: a mode that moved
             # while the stream was down reaches nothing else, and the reasoning about why
             # belongs beside the rest of the warm-up machinery. See
@@ -1989,6 +2066,9 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # because nothing pushes "an update is available". Cancelled on unload.
         self._firmware_unsub: Any = None
         self._firmware_task: asyncio.Task | None = None
+        # Local midnight tick: re-renders date-sensitive usage entities (`Water Used Today`,
+        # `Water Used This Week`, etc.) with zero network calls when the calendar day turns.
+        self._midnight_unsub: Any = None
         # One-shot: `async_setup` seeds, then `async_config_entry_first_refresh()` runs
         # milliseconds later and would seed the identical state all over again. See
         # `_async_update_data`.
@@ -2186,6 +2266,14 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._firmware_unsub = async_track_time_interval(
             self.hass, self._async_firmware_tick, FIRMWARE_CHECK_INTERVAL
         )
+        self._midnight_unsub = async_track_time_change(
+            self.hass, self._async_midnight_tick, hour=0, minute=0, second=1
+        )
+
+    @callback
+    def _async_midnight_tick(self, _now: Any) -> None:
+        """Re-render date-sensitive usage entities at local midnight with no API call."""
+        self.async_refresh_entities()
 
     @callback
     def _migrate_valve_settings(self, device_id: str) -> None:
@@ -2294,6 +2382,9 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._firmware_unsub is not None:
             self._firmware_unsub()
             self._firmware_unsub = None
+        if self._midnight_unsub is not None:
+            self._midnight_unsub()
+            self._midnight_unsub = None
         if self._firmware_task is not None:
             self._firmware_task.cancel()
             self._firmware_task = None
@@ -2401,7 +2492,10 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._persist_refresh_token()
             return self._snapshot()
         try:
-            await self._async_seed_state()
+            await asyncio.gather(
+                self._async_seed_state(),
+                *(valve.async_refresh_daily_usage() for valve in self.valves),
+            )
         except AuthUnavailable as err:
             raise UpdateFailed(f"Kohler auth service unreachable: {err}") from err
         except AuthError as err:

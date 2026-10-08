@@ -566,9 +566,9 @@ def test_monthly_water_leaves_litres_alone_on_a_metric_account():
 
 def test_monthly_water_matches_the_month_rather_than_taking_the_last_entry():
     """The series can end on a month with no data; position is not identity."""
-    from datetime import UTC, datetime
+    from homeassistant.util import dt as dt_util
 
-    key = datetime.now(UTC).strftime("%Y-%m")
+    key = dt_util.now().strftime("%Y-%m")
     usage = {
         "gcsUsageDataDetailsList": [
             {"intervalKey": key, "volume": 100, "onDuration": 600},
@@ -1721,27 +1721,34 @@ def test_auto_restore_says_whether_the_fault_can_even_occur(valve_model):
 
 
 # --------------------------------------------------------------------------- #
-# Water used this year (0.13.0)
+# Water used this year (calendar year to date)
 # --------------------------------------------------------------------------- #
 
 
 def _yearly_sensor(
-    valve_model, monkeypatch, series, units="Standard", now_month="2026-09"
+    valve_model,
+    monkeypatch,
+    series,
+    units="Standard",
+    now_month="2026-09",
+    daily_series=None,
 ):
     from datetime import datetime
 
     from custom_components.kohler_anthem import sensor as module
 
-    # Pin the clock: the sensor excludes whatever month `datetime.now` says it is, so on
-    # the real clock these tests start failing the moment `now_month` is in the past.
-    class _PinnedDateTime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return datetime.strptime(f"{now_month}-15", "%Y-%m-%d").replace(tzinfo=tz)
+    # Pin the local clock so calendar-year-to-date tests are deterministic regardless
+    # of the real clock.
+    class _PinnedNow:
+        @staticmethod
+        def now():
+            return datetime.strptime(f"{now_month}-15", "%Y-%m-%d")
 
-    monkeypatch.setattr(module, "datetime", _PinnedDateTime)
+    monkeypatch.setattr(module, "dt_util", _PinnedNow)
     valve = make_valve(valve_model, [31, 11, 1])
-    valve.usage = {"gcsUsageDataDetailsList": series}
+    valve.usage = {"gcsUsageDataDetailsList": series} if series is not None else {}
+    if daily_series is not None:
+        valve.usage_daily = {"gcsUsageDataDetailsList": daily_series}
     coordinator = make_coordinator([valve])
     coordinator.water_units = units
     sensor = next(
@@ -1752,60 +1759,81 @@ def _yearly_sensor(
     return sensor
 
 
-def test_yearly_water_sums_twelve_complete_months(valve_model, monkeypatch):
-    """500 gallons a month for a year, in the litres the API actually returns."""
+def test_yearly_water_sums_calendar_year_to_date(valve_model, monkeypatch):
+    """500 gallons a month across Jan–Sep of the current calendar year."""
     litres_per_month = 500 / 0.264172
     series = [
         {"intervalKey": f"2025-{m:02d}", "volume": litres_per_month}
         for m in range(9, 13)
     ] + [
         {"intervalKey": f"2026-{m:02d}", "volume": litres_per_month}
-        for m in range(1, 9)
+        for m in range(1, 10)
     ]
-    sensor = _yearly_sensor(valve_model, monkeypatch, series)
-    assert sensor.native_value == pytest.approx(6000, abs=1)
-    assert sensor.extra_state_attributes["months_counted"] == 12
+    sensor = _yearly_sensor(valve_model, monkeypatch, series, now_month="2026-09")
+    assert sensor.native_value == pytest.approx(4500, abs=1)
+    assert sensor.extra_state_attributes["year"] == "2026"
+    assert sensor.extra_state_attributes["months_counted"] == 9
+    assert sensor.extra_state_attributes["first_month"] == "2026-01"
+    assert sensor.extra_state_attributes["last_month"] == "2026-09"
 
 
-def test_yearly_water_excludes_the_current_month(valve_model, monkeypatch):
-    """A rolling window that crept up through the month would not be a `TOTAL`.
+def test_yearly_water_overlays_daily_usage_for_current_month(valve_model, monkeypatch):
+    """After a shower refreshes `usage_daily`, `Water Used This Year` updates immediately.
 
-    The partial month belongs to `Water Used This Month`; including it here would make the
-    value climb daily and then fall at every month boundary.
+    `self._valve.usage` (`Interval=MONTH`) is only read at startup and on month rollover,
+    while `usage_daily` (`Interval=DAY`, 35 days) is refreshed after every shower and
+    covers every day of the current month. Rolling up `usage_daily` for `this_month`
+    keeps the YTD total live with zero extra API requests.
     """
     litres = 100 / 0.264172
     series = [
         {"intervalKey": "2026-08", "volume": litres},
-        {"intervalKey": "2026-09", "volume": litres * 99},  # the current, partial month
+        {"intervalKey": "2026-09", "volume": litres},  # startup snapshot: 100 gal
     ]
-    sensor = _yearly_sensor(valve_model, monkeypatch, series)
-    assert sensor.native_value == pytest.approx(100, abs=1)
-    assert sensor.extra_state_attributes["excludes_current_month"] == "2026-09"
+    daily_series = [
+        {"intervalKey": "2026-09-01", "volume": litres},
+        {"intervalKey": "2026-09-15", "volume": litres * 0.5},  # +50 gal shower today
+    ]
+    sensor = _yearly_sensor(
+        valve_model,
+        monkeypatch,
+        series,
+        now_month="2026-09",
+        daily_series=daily_series,
+    )
+    assert sensor.native_value == pytest.approx(250, abs=1)
+    assert sensor.extra_state_attributes["per_month"]["2026-09"] == pytest.approx(
+        150, abs=0.2
+    )
 
 
-def test_yearly_water_takes_only_the_twelve_most_recent(valve_model, monkeypatch):
-    """A 400-day fetch returns thirteen months; the thirteenth must not inflate the year."""
+def test_yearly_water_excludes_prior_calendar_year(valve_model, monkeypatch):
+    """A 400-day fetch returns prior-year months; only the current calendar year counts."""
     litres = 100 / 0.264172
     series = [{"intervalKey": f"2025-{m:02d}", "volume": litres} for m in range(1, 13)]
     series += [{"intervalKey": f"2026-{m:02d}", "volume": litres} for m in range(1, 9)]
-    sensor = _yearly_sensor(valve_model, monkeypatch, series)
-    assert sensor.extra_state_attributes["months_counted"] == 12
-    assert sensor.native_value == pytest.approx(1200, abs=1)
+    sensor = _yearly_sensor(valve_model, monkeypatch, series, now_month="2026-09")
+    assert sensor.extra_state_attributes["year"] == "2026"
+    assert sensor.extra_state_attributes["months_counted"] == 8
+    assert sensor.native_value == pytest.approx(800, abs=1)
+    assert sensor.extra_state_attributes["first_month"] == "2026-01"
     assert sensor.extra_state_attributes["last_month"] == "2026-08"
 
 
 def test_yearly_water_reports_a_short_series_honestly(valve_model, monkeypatch):
-    """A young account has fewer than twelve months, and must not read as a dry year."""
+    """A young account has fewer months, and works even in its first month via daily data."""
     litres = 100 / 0.264172
     series = [{"intervalKey": "2026-07", "volume": litres}]
-    sensor = _yearly_sensor(valve_model, monkeypatch, series)
+    sensor = _yearly_sensor(valve_model, monkeypatch, series, now_month="2026-09")
     assert sensor.native_value == pytest.approx(100, abs=1)
     assert sensor.extra_state_attributes["months_counted"] == 1
 
 
 def test_yearly_water_stays_in_litres_on_a_metric_account(valve_model, monkeypatch):
     series = [{"intervalKey": "2026-08", "volume": 1000.0}]
-    sensor = _yearly_sensor(valve_model, monkeypatch, series, units="Liters")
+    sensor = _yearly_sensor(
+        valve_model, monkeypatch, series, units="Liters", now_month="2026-09"
+    )
     assert sensor.native_value == pytest.approx(1000.0)
 
 
@@ -3960,3 +3988,370 @@ def test_zone_grouping_choices_are_translated_in_every_language():
         assert {"title", "description", "data"} <= set(step), path
         # Says who it is for, so a single-zone owner knows it does nothing for them.
         assert "K-28211" in step["description"], path
+
+
+# --------------------------------------------------------------------------- #
+# Water usage accuracy & update responsiveness
+# --------------------------------------------------------------------------- #
+
+
+def test_monthly_water_updates_from_daily_series_after_shower(monkeypatch):
+    """`Water Used This Month` rolls up `usage_daily` so it updates after every shower."""
+    from datetime import datetime
+
+    from custom_components.kohler_anthem import sensor as module
+    from custom_components.kohler_anthem.anthem.models import get_valve_model
+
+    class _PinnedNow:
+        @staticmethod
+        def now():
+            return datetime(2026, 9, 15, 12, 0)
+
+    monkeypatch.setattr(module, "dt_util", _PinnedNow)
+    valve = make_valve(get_valve_model("K-28210"), [31, 11, 1])
+    # Startup MONTH series had 100 L (600 s) for 2026-09.
+    valve.usage = {
+        "gcsUsageDataDetailsList": [
+            {"intervalKey": "2026-08", "volume": 1811, "onDuration": 24371},
+            {"intervalKey": "2026-09", "volume": 100, "onDuration": 600},
+        ]
+    }
+    valve.usage_daily = {}
+    coordinator = make_coordinator([valve])
+    coordinator.water_units = "Liters"
+    sensor = module.ValveMonthlyWaterSensor(coordinator, valve)
+    assert sensor.native_value == 100.0
+    assert sensor.extra_state_attributes["running_minutes"] == 10.0
+
+    # After a shower, only `usage_daily` is refreshed (no extra MONTH request).
+    valve.usage_daily = {
+        "gcsUsageDataDetailsList": [
+            {"intervalKey": "2026-09-01", "volume": 100, "onDuration": 600},
+            {"intervalKey": "2026-09-15", "volume": 45, "onDuration": 300},
+        ]
+    }
+    assert sensor.native_value == 145.0
+    assert sensor.extra_state_attributes["running_minutes"] == 15.0
+    assert sensor.extra_state_attributes["history"]["2026-09"] == 145.0
+
+
+def test_water_used_today_resets_to_zero_at_midnight_when_series_exists(monkeypatch):
+    """When `usage_daily` has prior days but none for today yet, today is 0.0, not None."""
+    from datetime import UTC, date
+
+    from custom_components.kohler_anthem import sensor as module
+    from custom_components.kohler_anthem.anthem.models import model_for_topology
+
+    class _PinnedLocalNow:
+        @staticmethod
+        def now():
+            class _Today:
+                @staticmethod
+                def date():
+                    return date(2026, 9, 12)
+
+            return _Today()
+
+    class _PinnedUtcDateTime:
+        @staticmethod
+        def now(tz=None):
+            assert tz is UTC
+
+            class _Today:
+                @staticmethod
+                def date():
+                    return date(2026, 9, 12)
+
+            return _Today()
+
+    monkeypatch.setattr(module, "dt_util", _PinnedLocalNow)
+    monkeypatch.setattr(module, "datetime", _PinnedUtcDateTime)
+    valve = make_valve(model_for_topology(3, 0), [31, 11, 1])
+    valve.usage_daily = _REAL_DAY_SERIES  # last entry is 2026-09-11
+    coordinator = make_coordinator([valve])
+    today = module.ValveDailyWaterSensor(coordinator, valve)
+    assert today.native_value == 0.0
+    assert today.extra_state_attributes == {"days_counted": 0}
+
+
+@pytest.mark.asyncio
+async def test_daily_usage_retries_once_only_when_first_read_lags():
+    """If the 90s read returns unchanged volume, one follow-up runs at 180s; otherwise none."""
+    from custom_components.kohler_anthem import coordinator as module
+
+    sleeps: list[float] = []
+    reads: list[dict] = []
+
+    async def _record_sleep(seconds):
+        sleeps.append(seconds)
+
+    class _Holder:
+        _track = module.Valve._track
+        _note_running_for_usage = module.Valve._note_running_for_usage
+        _async_refresh_daily_usage_soon = module.Valve._async_refresh_daily_usage_soon
+
+        def __init__(self, responses):
+            self._responses = list(responses)
+            self.usage_daily = {
+                "gcsUsageDataDetailsList": [
+                    {"intervalKey": "2026-09-15", "volume": 40.0}
+                ]
+            }
+            self.gcs_state = SimpleNamespace(is_running=False)
+            self._was_running = False
+            self._daily_usage_task = None
+            self._background_tasks = set()
+            self.hass = SimpleNamespace(async_create_task=asyncio.ensure_future)
+            self.coordinator = SimpleNamespace(async_refresh_entities=lambda: None)
+
+        async def async_refresh_daily_usage(self):
+            self.usage_daily = self._responses.pop(0)
+            reads.append(self.usage_daily)
+
+    # Case 1: First read at 90s already includes the new shower -> NO second read.
+    holder = _Holder(
+        [{"gcsUsageDataDetailsList": [{"intervalKey": "2026-09-15", "volume": 75.0}]}]
+    )
+    holder.gcs_state.is_running = True
+    holder._note_running_for_usage()
+    with patch.object(module.asyncio, "sleep", new=_record_sleep):
+        holder.gcs_state.is_running = False
+        holder._note_running_for_usage()
+        await holder._daily_usage_task
+
+    assert len(reads) == 1
+    assert sleeps == [module.USAGE_REFRESH_DELAY_SECONDS]
+
+    # Case 2: First read at 90s is unchanged (cloud lagged) -> one retry after 180s.
+    sleeps.clear()
+    reads.clear()
+    holder2 = _Holder(
+        [
+            {
+                "gcsUsageDataDetailsList": [
+                    {"intervalKey": "2026-09-15", "volume": 40.0}
+                ]
+            },
+            {
+                "gcsUsageDataDetailsList": [
+                    {"intervalKey": "2026-09-15", "volume": 75.0}
+                ]
+            },
+        ]
+    )
+    holder2.gcs_state.is_running = True
+    holder2._note_running_for_usage()
+    with patch.object(module.asyncio, "sleep", new=_record_sleep):
+        holder2.gcs_state.is_running = False
+        holder2._note_running_for_usage()
+        await holder2._daily_usage_task
+
+    assert len(reads) == 2
+    assert sleeps == [
+        module.USAGE_REFRESH_DELAY_SECONDS,
+        module.USAGE_RETRY_DELAY_SECONDS,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_daily_usage_cancels_pending_task_when_water_restarts():
+    """Restarting water during the 90s wait cancels the pending read until the new stop."""
+    from custom_components.kohler_anthem import coordinator as module
+
+    gate = asyncio.Event()
+    reads = 0
+    real_sleep = asyncio.sleep
+
+    async def _gated_sleep(seconds):
+        if seconds > 0:
+            await gate.wait()
+        else:
+            await real_sleep(0)
+
+    class _Holder:
+        _track = module.Valve._track
+        _note_running_for_usage = module.Valve._note_running_for_usage
+        _async_refresh_daily_usage_soon = module.Valve._async_refresh_daily_usage_soon
+
+        def __init__(self):
+            self.usage_daily = {}
+            self.gcs_state = SimpleNamespace(is_running=False)
+            self._was_running = False
+            self._daily_usage_task = None
+            self._background_tasks = set()
+            self.hass = SimpleNamespace(async_create_task=asyncio.ensure_future)
+            self.coordinator = SimpleNamespace(async_refresh_entities=lambda: None)
+
+        async def async_refresh_daily_usage(self):
+            nonlocal reads
+            reads += 1
+
+    holder = _Holder()
+    with patch.object(module.asyncio, "sleep", new=_gated_sleep):
+        holder.gcs_state.is_running = True
+        holder._note_running_for_usage()
+        holder.gcs_state.is_running = False
+        holder._note_running_for_usage()
+        first_task = holder._daily_usage_task
+        assert first_task is not None
+        await real_sleep(0)
+
+        # Water starts again before the 90s timer finishes.
+        holder.gcs_state.is_running = True
+        holder._note_running_for_usage()
+        assert holder._daily_usage_task is None
+        await real_sleep(0)
+        assert first_task.cancelled()
+        assert reads == 0
+
+
+@pytest.mark.asyncio
+async def test_daily_usage_refreshes_monthly_series_on_month_rollover(monkeypatch):
+    """When a shower finishes in a new local calendar month, `self.usage` refreshes once."""
+    from datetime import datetime
+
+    from custom_components.kohler_anthem import coordinator as module
+
+    calls: list[str] = []
+
+    class _PinnedNow:
+        @staticmethod
+        def now():
+            return datetime(2026, 10, 1, 8, 0)
+
+    monkeypatch.setattr(module, "dt_util", _PinnedNow)
+
+    async def _get_usage(_device_id, *, from_date, to_date, interval="MONTH"):
+        calls.append(interval)
+        return {"gcsUsageDataDetailsList": [{"intervalKey": "2026-10", "volume": 10}]}
+
+    holder = SimpleNamespace(
+        gcs_device=SimpleNamespace(device_id="gcs-1"),
+        client=SimpleNamespace(async_get_usage=_get_usage),
+        usage={"gcsUsageDataDetailsList": [{"intervalKey": "2026-09", "volume": 500}]},
+        usage_daily={},
+        _usage_seeded_month="2026-09",
+    )
+    holder.async_refresh_monthly_usage = lambda: (
+        module.Valve.async_refresh_monthly_usage(holder)
+    )
+
+    await module.Valve.async_refresh_daily_usage(holder)
+    assert calls == ["DAY", "MONTH"]
+    assert holder._usage_seeded_month == "2026-10"
+
+    # Subsequent refreshes within the same month only fetch DAY.
+    calls.clear()
+    await module.Valve.async_refresh_daily_usage(holder)
+    assert calls == ["DAY"]
+
+
+@pytest.mark.asyncio
+async def test_transient_empty_usage_response_preserves_in_memory_history():
+    """A transient `{}` from `async_get_usage` must not wipe existing `usage` or `usage_daily`."""
+    from custom_components.kohler_anthem import coordinator as module
+
+    async def _get_empty_usage(_device_id, *, from_date, to_date, interval="MONTH"):
+        return {}
+
+    prior_monthly = {
+        "gcsUsageDataDetailsList": [{"intervalKey": "2026-08", "volume": 1811}]
+    }
+    prior_daily = {
+        "gcsUsageDataDetailsList": [{"intervalKey": "2026-09-15", "volume": 40}]
+    }
+    holder = SimpleNamespace(
+        gcs_device=SimpleNamespace(device_id="gcs-1"),
+        client=SimpleNamespace(async_get_usage=_get_empty_usage),
+        usage=prior_monthly,
+        usage_daily=prior_daily,
+        _usage_seeded_month="2026-09",
+    )
+    holder.async_refresh_monthly_usage = lambda: (
+        module.Valve.async_refresh_monthly_usage(holder)
+    )
+
+    await module.Valve.async_refresh_monthly_usage(holder)
+    await module.Valve.async_refresh_daily_usage(holder)
+    assert holder.usage is prior_monthly
+    assert holder.usage_daily is prior_daily
+
+
+@pytest.mark.asyncio
+async def test_daily_usage_refresh_handles_auth_error_without_unhandled_exception():
+    """`AuthError` in the post-shower task is caught and triggers reauth if credentials died."""
+    from custom_components.kohler_anthem import coordinator as module
+    from custom_components.kohler_anthem.anthem.auth import AuthError
+
+    auth_errors: list[Exception] = []
+
+    class _Holder:
+        _track = module.Valve._track
+        _note_running_for_usage = module.Valve._note_running_for_usage
+        _async_refresh_daily_usage_soon = module.Valve._async_refresh_daily_usage_soon
+
+        def __init__(self):
+            self.usage_daily = {}
+            self.gcs_state = SimpleNamespace(is_running=False)
+            self._was_running = False
+            self._daily_usage_task = None
+            self._background_tasks = set()
+            self.hass = SimpleNamespace(async_create_task=asyncio.ensure_future)
+            self.coordinator = SimpleNamespace(
+                async_refresh_entities=lambda: None,
+                _handle_auth_error=auth_errors.append,
+            )
+
+        async def async_refresh_daily_usage(self):
+            raise AuthError("invalid_grant: refresh token expired")
+
+    holder = _Holder()
+    holder.gcs_state.is_running = True
+    holder._note_running_for_usage()
+    with patch.object(module.asyncio, "sleep", new=_noop_sleep):
+        holder.gcs_state.is_running = False
+        holder._note_running_for_usage()
+        await holder._daily_usage_task
+
+    assert len(auth_errors) == 1
+
+
+def test_monthly_and_yearly_water_use_local_timezone_not_utc(monkeypatch):
+    """US evening on Dec 31 (already Jan 1 in UTC) stays in Dec / current year locally."""
+    from datetime import UTC, datetime
+
+    from custom_components.kohler_anthem import sensor as module
+    from custom_components.kohler_anthem.anthem.models import get_valve_model
+
+    class _PinnedLocalNow:
+        @staticmethod
+        def now():
+            return datetime(2026, 12, 31, 20, 0)
+
+    class _PinnedUtcDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is UTC
+            return datetime(2027, 1, 1, 1, 0, tzinfo=UTC)
+
+    monkeypatch.setattr(module, "dt_util", _PinnedLocalNow)
+    monkeypatch.setattr(module, "datetime", _PinnedUtcDateTime)
+
+    valve = make_valve(get_valve_model("K-28210"), [31, 11, 1])
+    valve.usage = {
+        "gcsUsageDataDetailsList": [
+            {"intervalKey": "2026-11", "volume": 500},
+            {"intervalKey": "2026-12", "volume": 200},
+        ]
+    }
+    valve.usage_daily = {}
+    coordinator = make_coordinator([valve])
+    coordinator.water_units = "Liters"
+
+    monthly = module.ValveMonthlyWaterSensor(coordinator, valve)
+    yearly = module.ValveYearlyWaterSensor(coordinator, valve)
+
+    assert monthly.native_value == 200.0
+    assert monthly.extra_state_attributes["month"] == "2026-12"
+    assert yearly.native_value == 700.0
+    assert yearly.extra_state_attributes["year"] == "2026"
