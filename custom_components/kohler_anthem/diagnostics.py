@@ -351,7 +351,7 @@ def _fault_log(payload: Mapping[str, Any] | None) -> list[dict[str, Any]]:
 
 
 def _valve_report(valve: Valve) -> dict[str, Any]:
-    """One valve's state, limits, and its own Endless Shower and warm-up settings."""
+    """One valve's state, limits, run-time clocks and warm-up settings."""
     gcs = valve.gcs_state
     model = valve.model
     return {
@@ -448,13 +448,10 @@ def _valve_report(valve: Valve) -> dict[str, Any]:
         # installation detail, and what the question needs is which keys are populated, not
         # what is in them. Firmware is named in full because it is the useful part today.
         "configuration": _configuration_report(valve),
-        "endless_shower": {
-            "enabled": valve.restart_on_runtime_cutoff,
-            "run_times_seconds": {
+        "run_time": {
+            "limits_seconds": {
                 str(k): v for k, v in sorted(valve.outlet_run_times.items())
             },
-            "armed_zones": valve.armed_zones,
-            "zones_awaiting_run_time": valve.zones_awaiting_run_time,
             "flowing_for_seconds": {
                 str(zone): valve.zone_flowing_for(zone) for zone in model.zones
             },
@@ -583,10 +580,10 @@ def _build(
         },
     }
 
-    # One entry per valve, in the cloud's order. `valve`, `endless_shower` and `warmup`
+    # One entry per valve, in the cloud's order. `valve`, `run_time` and `warmup`
     # (singular) are kept so reports from before 2026-09-08 and after read the same on a
-    # single-valve account; `valves` carries all of them, each with its own
-    # `endless_shower` and `warmup` nested inside.
+    # single-valve account; `valves` carries all of them, each with its own `run_time`
+    # and `warmup` nested inside. (`run_time` was `endless_shower` until 2026-10-08.)
     #
     # **The singular block describes the valve whose button was pressed, not always the
     # first.** Until 2026-09-09 it was hardcoded to index 0, so a report downloaded from
@@ -603,9 +600,9 @@ def _build(
             reports[valve_index] if 0 <= valve_index < len(reports) else reports[0]
         )
         payload["valve"] = {
-            k: v for k, v in primary.items() if k not in ("endless_shower", "warmup")
+            k: v for k, v in primary.items() if k not in ("run_time", "warmup")
         }
-        payload["endless_shower"] = primary["endless_shower"]
+        payload["run_time"] = primary["run_time"]
         payload["warmup"] = primary["warmup"]
         payload["valves"] = reports
 

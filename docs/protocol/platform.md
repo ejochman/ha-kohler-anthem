@@ -18,7 +18,7 @@ Confidence markers are explained in the [README](README.md#confidence): **live**
 | Redirect URI | `msauth.com.kohler.hermoth://auth` — strictly validated; the older `msauth://com.kohler.hermoth/<hash>` is **no longer registered** | live |
 | Authority | `https://konnectkohler.b2clogin.com/tfp/konnectkohler.onmicrosoft.com/B2C_1A_signin` | live |
 
-**Writes need a token from the `B2C_1A_signin` policy.** Tokens from the ROPC policy are accepted for reads but get HTTP 403 on `/commands/*` (live). The redirect URI is a custom scheme, so the usual browser round trip is impossible. Both integrations instead drive the policy server-side, the way the sign-in page's own JavaScript does:
+**Anthem writes need a token from the `B2C_1A_signin` policy.** Tokens from the ROPC policy are accepted for reads but get HTTP 403 on the Anthem's `/commands/*` (live). **The Sensate faucet accepts ROPC tokens for its commands** (`commands/faucet/onoff` and `dispense`, live in `ha-kohler-sensate`), so the restriction is per product, not account-wide. The redirect URI is a custom scheme, so the usual browser round trip is impossible. Both integrations instead drive the policy server-side, the way the sign-in page's own JavaScript does:
 
 1. `GET /authorize` with PKCE. Keep the cookies, and take `csrf` and `transId` from the page's `var SETTINGS = {...}` blob.
 2. `POST {policy}/SelfAsserted` with the email and password. A small JSON status comes back; `AADB2C90053` means bad credentials.
@@ -85,7 +85,7 @@ Every read carries a device or tenant id in its path. If you log or raise errors
 `GET /devices/api/v1/device-management/customer-device/{tenantId}` (live) returns:
 
 - `temperatureUnit` (`Fahrenheit` / `Celsius`) — the account's **display** preference;
-- `waterUnits` (`Standard` = US gallons, or `Liters`);
+- `waterUnits` (`Standard` = US gallons, or `Metric`; `Metric` seen live on a Sensate account, and the faucet chapter's app models use the same pair);
 - `customerHome[].devices[]` — note the singular key. Each device has `deviceId`, `sku`, `logicalName` and `serialNumber`.
 
 **Never use the shape of a device id to tell products apart.** An Anthem Plus controller's id can begin with `gcs`. Branch on `sku`.
@@ -189,7 +189,7 @@ State reads (`gcs-state/gcsadvancestate`, `hub-state`, the faucet state) carry:
 - `lastConnected` (epoch)
 - `deviceConnectionEventSequenceNumber`
 
-Only `Connected` has been captured. `Disconnected` is the negative the app tests for, and **the app treats a device as online unless the value is exactly `Disconnected`** (app, `mc0/n.java`, `ui/ota/f.java`). Nothing pushes this field. Read it when you have a reason to doubt reachability; see `cloud_watch.py` for an event-driven way to decide when.
+Only `Connected` has been captured. `Disconnected` is the negative the app tests for, and **the app treats a device as online unless the value is exactly `Disconnected`** (app, `mc0/n.java`, `ui/ota/f.java`). The faucet screens are the exception: they compare with `Connected` and default a **missing** value to `Disconnected` (app; see the faucet chapter, §2.2). Nothing pushes this field. Read it when you have a reason to doubt reachability; see `cloud_watch.py` for an event-driven way to decide when.
 
 ## 6. Water usage
 
@@ -210,7 +210,7 @@ Only `Connected` has been captured. `Disconnected` is the negative the app tests
 - **Response** (`AnthemWaterUsageModel` for GCS; other products are analogous):
   - Summary fields: `avg/min/max` of `AverageBlendTemperature`, `NumberOfTimesValveSwitchedOn`, `OnDuration` and `Volume`, plus `interval` and `deviceId`.
   - Buckets: `gcsUsageDataDetailsList[] {intervalKey, volume, onDuration, numberOfTimesValveSwitchedOn, averageBlendTemperature, timestamp}`. `intervalKey` is `yyyy-MM-dd` or `yyyy-MM`.
-  - The HUB adds hot inlet temperatures; the faucet list is `senSateUsageDataDetailsList`.
+  - The HUB adds hot inlet temperatures; the faucet list is `faucetUsageDataDetailsList` (live; `SenSateUsageDataDetailsList` is only the name of its model class).
 - **`volume` is litres** whatever the account unit. The app multiplies by `0.264172` for `Standard`.
 - **No unit is known for `averageBlendTemperature`.** The app never displays it, so don't guess one.
 
@@ -230,10 +230,11 @@ The check returns `{currentFirmware, firmware (the latest), firmwareUpdateAvaila
 Guards the app applies before installing:
 - no water running;
 - the device not `Disconnected`;
-- on a faucet, the handle open.
+- on a faucet, the handle open. (The faucet chapter, §2.6, found only the first two in the faucet OTA flow. Unresolved.)
 
 While installing:
 - The app polls every 10 s for up to 2 h, reading the product's configuration `firmwareUpdate` block `{progress, progressPercent, status, version, …}`.
+- Faucets differ (faucet chapter, §2.6): the faucet flow polls `faucet-configuration` every 10 s for up to 3 min until `configuration.about.firmware.version` equals the target, and never reads `firmwareUpdate`; `faucet-state.progress == "Downloading"` locks the controls meanwhile.
 - Faucets also send MQTT `INSTALL_FIRMWARE_STS {code, status: Installed|Aborted, version}`.
 
 `otaStatus` values:

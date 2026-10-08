@@ -5,6 +5,34 @@ Notable changes for each tagged release. Versions correspond to git tags and to 
 **Unreleased** as part of each change; the release workflow rotates that section into a
 version heading and publishes it as the release's Highlights.
 
+## Unreleased
+
+**New**
+
+- **Anthem Plus device page links to the controller's web settings page**, using the
+  network address Kohler's cloud reports for it (Wi-Fi, or wired when there's no Wi-Fi
+  address). Found the same way the Konnect app finds it, but not yet tried on a real
+  controller.
+
+**Removed**
+
+- **Endless Shower.** The switch that turned the water back on when the valve reached its
+  Max Shower Duration is gone. Running water without end isn't something the Konnect app
+  offers, and this integration no longer does either. For a longer shower, raise the valve's
+  `Max Shower Duration` (up to 60 minutes) and, with an Anthem Plus, the controller's own.
+  Upgrading removes the switch, its stored settings and its repair notices automatically.
+- **The duration-mismatch repair notice** added in 0.20. It existed only for Endless Shower.
+  The controller's `Max Shower Duration` sensor stays: the shorter of the two limits ends a
+  shower.
+- **The `cutoff_*.jsonl` debug journal**, which recorded Endless Shower's decisions. The
+  `Start new MQTT capture` button now starts a new raw capture file only.
+
+**Changed**
+
+- Diagnostics: the `endless_shower` block is now `run_time`, holding the valve's run-time
+  limits and how long each zone has been running. The `flowing_for_seconds` and
+  `seconds_remaining` attributes are unchanged.
+
 ## 0.20 — 2026-10-08
 
 Built from a decompile of the Kohler Konnect Android app, version 3.0.6. It settled most of

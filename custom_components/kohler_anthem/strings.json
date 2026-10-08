@@ -36,17 +36,9 @@
     }
   },
   "issues": {
-    "endless_shower_not_set_up": {
-      "title": "Endless Shower is waiting on your valve",
-      "description": "Endless Shower is turned on, but Home Assistant has not been able to read the shower time limit from your valve yet, so it cannot restart your shower.\n\n**No action is needed.** The limit is normally read during setup, and Endless Shower arms itself the moment it arrives. This message clears on its own.\n\nIf it is still here after a few minutes, the valve is unreachable — check that it is online in the Kohler Konnect app, then reload the integration."
-    },
     "outlet_write_unverified": {
       "title": "A shower setting may not have been applied",
       "description": "Home Assistant asked your valve to change **{setting}**, and the valve accepted the request — but reading the value back afterwards did not show the change.\n\n{detail}\n\n**What this means.** Kohler's API answers \"accepted for delivery\", never \"applied\", so this check exists to catch the difference. The setting may still be the old value.\n\n**What to do.** Open the entity and set it again. If it fails a second time, check the valve is online in the Kohler Konnect app — a valve that has dropped off the cloud accepts commands that never reach it.\n\nThis message clears when a change verifies."
-    },
-    "durations_differ": {
-      "title": "Your two Max Shower Durations differ",
-      "description": "Endless Shower is on for **{valve}**, whose shower time limit is **{valve_minutes} minutes**, but **{controller}** stops a shower after **{controller_minutes} minutes**.\n\n**Why it matters.** Endless Shower restarts the shower when the valve's limit pauses it. When the controller's limit is different, the controller can end the shower on its own timer instead, and that stop cannot be undone.\n\n**What to do.** Set both to the same value: the valve's in the Kohler Konnect app (shower settings → Max Shower Duration) or with this integration's Max Shower Duration control, and the controller's on its own settings page. This message clears once they match — the controller's value is re-read when Home Assistant reconnects to Kohler."
     }
   }
 }

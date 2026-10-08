@@ -126,7 +126,7 @@ class ReportLog:
 
         `write()` is called from paho's network thread, where opening a file is fine.
         `note()` is called from the **event loop**, where it is not — so `note()` never
-        opens one and raises this instead, exactly as `CutoffDebugLog` does. The caller
+        opens one and raises this instead, exactly as `DebugJournal` does. The caller
         schedules `prepare()` in an executor; the record that raised the flag is lost and
         the next one lands.
         """
@@ -238,21 +238,21 @@ class ReportLog:
         """Record one **decision** — what the integration concluded, not what arrived.
 
         The raw messages say what the valve sent; these say what was made of it. Both in one
-        file, in the order they happened, on one clock, so a report answers "the cutoff did
-        not fire" without asking the reader to line two files up by timestamp. One switch,
+        file, in the order they happened, on one clock, so a report answers "why was warmup
+        not restored" without asking the reader to line two files up by timestamp. One switch,
         one attachment.
 
         Told apart from a raw message by their keys: a message has `topic`, a decision has
-        `journal` (`cutoff` or `warmup`, since the two vocabularies reuse event names) and
-        `event`. To read one or the other:
+        `journal` (`warmup` today; reports from before 2026-10-08 can also carry `cutoff`,
+        from the removed Endless Shower) and `event`. To read one or the other:
 
             jq -c 'select(.topic)'    report_*.jsonl   # the wire
             jq -c 'select(.journal)'  report_*.jsonl   # the reasoning
 
-        **Written whether or not the features are switched on**, exactly as the standalone
-        journals are, so a report from an install with Endless Shower and Auto-Restore both
-        off still shows a cutoff that was seen and deliberately skipped — which is usually
-        the question being asked.
+        **Written whether or not the feature is switched on**, exactly as the standalone
+        journal is, so a report from an install with Auto-Restore off still shows a disable
+        that was seen and deliberately left alone — which is usually the question being
+        asked.
         """
         if self._stem is None:
             return
@@ -270,12 +270,11 @@ class ReportLog:
             if self._stem is None:
                 return
             # ⚠️ **Never opens a file.** Unlike `write()`, which paho calls on its own network
-            # thread, this runs on the **event loop** — the cutoff detector and the warm-up
-            # watcher both live there — and `_open_locked` creates a directory and opens two
+            # thread, this runs on the **event loop** — the warm-up watcher lives there — and `_open_locked` creates a directory and opens two
             # files. Blocking calls on the loop are an error in Home Assistant, and this
             # shipped doing exactly that in 0.15.0.
             #
-            # Same answer as `CutoffDebugLog.note`: raise a flag and let the caller schedule
+            # Same answer as `DebugJournal.note`: raise a flag and let the caller schedule
             # `prepare()` in an executor. The cost is that a decision arriving while no file
             # is open is dropped and the next one lands — acceptable for a diagnostic, and
             # the usual case is a file already open from `start()` or `resume()`.

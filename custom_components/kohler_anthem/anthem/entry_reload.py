@@ -1,17 +1,14 @@
 """Decide whether a config-entry update actually needs the integration reloaded.
 
 Home Assistant fires an entry's update listener on **every** ``async_update_entry`` call,
-and this integration writes to its own entry while running:
+and this integration writes to its own entry while running — above all the refresh token,
+because Azure B2C rotates it and issues a new one on every refresh (``anthem/auth.py``), so
+it is rewritten constantly. Per-valve bookkeeping such as the remembered warm-up mode is
+written too.
 
-* the refresh token, because Azure B2C rotates it and issues a new one on every refresh
-  (``anthem/auth.py``) — so it is rewritten constantly;
-* ``maximumRunTime``, whenever the valve announces one, which it does unprompted and can do
-  **mid-shower**.
-
-Reloading on either would tear down and rebuild every platform, flap all entities to
-``unavailable``, drop the MQTT connection with its warm-up, and — worse — hand the run-time
-cutoff feature a fresh ``ZoneCutoffDetector`` whose zone clocks start at zero while the
-valve's own timer keeps counting. That is precisely how a cutoff gets missed.
+Reloading on any of those would tear down and rebuild every platform, flap all entities to
+``unavailable``, drop the MQTT connection with its warm-up, and reset the zone clocks behind
+the time-left attributes while the valve's own timer keeps counting.
 
 So the listener has to tell a real configuration change from the integration's own
 bookkeeping, and it does that by comparing a **signature taken at setup** against the live

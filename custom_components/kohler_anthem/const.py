@@ -41,9 +41,9 @@ CONF_WATER_UNITS = "water_units"
 CONF_MOBILE_DEVICE_ID = "mobile_device_id"
 # Per-valve settings, keyed by the valve's device id, in both `entry.data` and
 # `entry.options` — an account can carry several valves since 2026-09-08, and each has
-# its own learned run times (data) and its own Endless Shower, Warmup Auto-Restore and
-# remembered warm-up mode (options). The flat keys those used to be are migrated under
-# here once, at setup, by `KohlerAnthemCoordinator._migrate_valve_settings`.
+# its own Warmup Auto-Restore and remembered warm-up mode (options). The flat keys those
+# used to be are migrated under here once, at setup, by
+# `KohlerAnthemCoordinator._migrate_valve_settings`.
 # Reload-ignored in both lists for the same reason every one of those keys was.
 CONF_VALVES = "valves"
 
@@ -195,162 +195,6 @@ REPORT_LOG_DIR_NAME = "reports"
 REPORT_LOG_MAX_BYTES = 8 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
-# CUTOFF DEBUG LOG — why the run-time cutoff fired, or didn't
-# ---------------------------------------------------------------------------
-# Full explanation and how to read it against the raw capture: `anthem/cutoff_log.py`.
-# Find every piece of this feature with:
-#
-#     grep -rn "CUTOFF DEBUG LOG" custom_components/kohler_anthem/
-#
-# Runtime switch, no restart needed — Developer Tools -> Actions -> `logger.set_level`:
-#
-#     custom_components.kohler_anthem.anthem.cutoff_log: debug
-#
-# **Off by default, and it must ship off.** Switched on 2026-08-14 after the detector was
-# found to be timing the wrong thing, and shipped that way through 0.6.7 by oversight. A
-# cutoff that fails to fire writes nothing to `home-assistant.log`, so this journal is the
-# only way to tell "no cutoff happened" from "a cutoff was missed" — genuinely valuable
-# while investigating, and not something to leave running on every install.
-#
-# Written into the same directory as the raw capture and stamped from the same clock, so the
-# two interleave by sorting on `ts`. Volume is a handful of lines per shower, but unlike the
-# raw capture `CutoffDebugLog` has **no size cap at all** and `..._KEEP_FILES` below is None,
-# so nothing bounds a single file's growth.
-ENABLE_CUTOFF_DEBUG_LOG = False
-
-# None = no limit on the number of files; every log is kept forever, matching
-# RAW_MQTT_LOG_KEEP_FILES. Deliberately the same directory as the raw capture: these two logs
-# are read together, and splitting them across directories only makes the join harder.
-CUTOFF_DEBUG_LOG_KEEP_FILES = None
-
-# ---------------------------------------------------------------------------
-# Run-time cutoff restart (option, default off)
-# ---------------------------------------------------------------------------
-# The valve shuts a **zone** off once it has been running for `maximumRunTime` — 900 s on the
-# reference install now, 3600 s before it was reconfigured, reported per outlet in
-# `READ_GCS_OUTLET_CONFIG_CFG` but timed per zone. With this option on, the integration
-# re-opens the outlets that were running and the shower carries on.
-#
-# The per-zone part is not a detail: the timer starts when a zone begins flowing and does not
-# reset when outlets change within it. Timing each outlet instead — which shipped until
-# 2026-08-14 — misses every cutoff where somebody moved between shower heads. See
-# `anthem/runtime_cutoff.py`.
-#
-# **This defeats a manufacturer cutoff, and there is no resume limit.** Water will keep
-# coming back for as long as somebody leaves it running, with no software or hardware stop
-# behind it — the hardware stop is the thing being overridden. That is the owner's stated
-# choice, made after the trade-off was put to them explicitly; it is not an oversight to
-# "fix". Leave it default-off, keep every restart logged at WARNING, and do not extend it to
-# fire on anything other than a positive run-time match.
-CONF_RESTART_ON_RUNTIME_CUTOFF = "restart_on_runtime_cutoff"
-
-
-# Learned per-outlet `maximumRunTime`, persisted so the cutoff feature is armed from the first
-# second after a restart rather than waiting on an unprompted announcement.
-#
-# ⚠️ **Corrected 2026-08-17.** This comment used to say the value was "otherwise unobtainable on
-# demand" because every `gcs-outlet-config`-style REST path 404s. Those paths really do 404, but
-# the data was reachable all along: **`gcsadvancestate` carries
-# `setting.valveSettings[].outletConfigurations[]`**, and this integration already calls that
-# endpoint — `topology.py` reads `noOfOutlets` from the very same response. Verified live.
-#
-# Persisting is still worth it (one fewer REST round trip on the hot path), but the "blind
-# window" that justified it is not the constraint it was believed to be. Reading it at setup
-# was done on 2026-08-17 and runs on every reseed since — `_async_seed_state` reads
-# `gcsadvancestate` and feeds `_learn_run_times`, so the window is closed and this
-# persistence is now the belt to that suspender (it still arms the feature during the
-# seconds before the first seed completes, and across a seed that fails).
-#
-# Without persistence the cutoff feature is inert after every restart until the valve happens
-# to announce again, which can be a long wait and gives no sign of why nothing is happening.
-# The value is installation configuration and does not drift, so remembering it is safe; a
-# fresh announcement always overwrites what is stored.
-CONF_OUTLET_RUN_TIMES = "outlet_run_times"
-
-# ---------------------------------------------------------------------------
-# Endless Shower — the messages the owner actually reads
-# ---------------------------------------------------------------------------
-# Written for someone standing in a bathroom, not for whoever wrote the integration. The
-# feature is called **Endless Shower** everywhere the owner can see it; `maximumRunTime`,
-# `restart_on_runtime_cutoff` and the zone/outlet split are internal and stay out of these.
-#
-# The one setting a user can act on is **Max Shower Duration** in the Kohler Konnect app, so
-# every "it is not working" message points at exactly that and nothing else.
-#
-# Shared between the startup log in `coordinator.py` and the switch-on log in `switch.py`, so
-# the two cannot drift into saying different things about the same state.
-
-# Nothing to work with: no outlet has reported a duration, or only some have. Also used when
-# a cutoff fires but no outlet snapshot exists to restore.
-# ⚠️ **Reworded 2026-08-17 and it must stay this way.** This used to read "please reconfigure
-# 'Max Shower Duration' in the Kohler Konnect app" — advice that existed only because the limit
-# arrived over MQTT unprompted, so changing the app setting was the one way to provoke an
-# announcement. The integration now reads it over REST at setup (`gcsadvancestate`), so that
-# instruction is obsolete: this state is transient and self-healing, not something the owner
-# should be sent to the app to fix.
-ENDLESS_SHOWER_NOT_SET_UP = (
-    "Endless Shower is ON but the shower time limit has not been read from the valve yet, so "
-    "nothing will be restarted. It arms itself automatically as soon as the valve reports it."
-)
-
-# Armed. %s is the duration in whole minutes, from `describe_duration`.
-ENDLESS_SHOWER_ON = (
-    "Endless Shower is ON. Your shower will restart automatically every %s minutes, when "
-    "'Max Shower Duration' is reached."
-)
-
-# `ENDLESS_SHOWER_MATCH_DURATIONS` stood here until 2026-08-22 — an unconditional "set the
-# controller's Max Shower Duration to the SAME value" warning, printed at every start and
-# every toggle of any dual-product install. Removed on the owner's decision: this integration
-# could not know whether the durations actually differ (the hub's number was believed to be
-# local-API-only, and storing the hub PIN was ruled out), so the nag fired regardless.
-#
-# ✅ **It can know now.** Konnect 3.0.6 reads the controller's duration from the cloud,
-# `hub-configuration` `systemSettings.maxShowerDuration` (minutes). So the warning came back
-# in evidence-based form on 2026-10-07: `ISSUE_DURATION_MISMATCH`, raised only when both
-# numbers are known and differ — see `KohlerAnthemCoordinator._async_check_duration_match`. The advice itself still
-# holds — the valve fires marginally early, the controller marginally late, so equal
-# durations mean the valve's restorable `0x40` always wins — and the mismatch warning that
-# remains is evidence-based: `runtime_cutoff.py` warns when a minute-boundary stop shows the
-# controller preempting the valve (the direction with a valve-side fix), and only journals a
-# sweep past the valve's limit (no HA-side action exists).
-
-# A cutoff was caught and the shower put back. %s is the local time it was cut off.
-ENDLESS_SHOWER_RESTARTED = "Max Shower Duration reached at %s. Restarted the shower."
-
-# Defensive only. A cutoff cannot normally fire without a mask to restore: the detector sets
-# its start time and its last-running mask on the same update, and `forget()` clears both
-# together, so "timed a zone" and "knows what was in it" cannot come apart. It has never
-# fired — all seven restores in the capture corpus had a mask.
-#
-# ⚠️ **This is NOT the "Home Assistant restarted mid-shower" case.** That one produces no log
-# at all, and cannot: the clock restarts with the process, so at the valve's real cut-off the
-# measured duration falls short of the limit, nothing matches, and no cutoff is detected. The
-# shower simply ends. Deliberate — see `ZoneCutoffDetector`, which would rather miss a cutoff
-# than reopen a valve on a duration it did not actually measure.
-#
-# Says nothing about zones: the owner has no use for the zone number, and the cutoff debug
-# log carries it for anyone investigating. Logged once per affected zone, so two lines mean
-# two zones.
-# Repairs card shown while Endless Shower is on but cannot act. A log line states this once,
-# at startup, and then scrolls away — it can never answer "is it still broken?", which is the
-# only question the owner actually has. A repair is the opposite: it appears when the
-# condition becomes true, persists while it stays true, and removes itself when the valve
-# finally reports a duration. Nobody has to dismiss it.
-#
-# Doubles as the `translation_key`, so the text lives in `strings.json` under `issues`.
-ISSUE_NOT_SET_UP = "endless_shower_not_set_up"
-# Raised per controller when its cloud-readable Max Shower Duration differs from a valve's
-# `maximumRunTime` while Endless Shower is on — the configuration `runtime_cutoff` says to fix
-# ("match the two Max Shower Durations"), now detectable rather than assumed.
-ISSUE_DURATION_MISMATCH = "durations_differ"
-
-ENDLESS_SHOWER_NOTHING_TO_RESTORE = (
-    "Endless Shower could not restart the shower, because Home Assistant has no record of "
-    "what was running."
-)
-
-# ---------------------------------------------------------------------------
 # Preset 1's hidden timer — normalised once at setup
 # ---------------------------------------------------------------------------
 # A GCS preset carries its own `time`, a second run-time limit independent of the outlets'
@@ -402,14 +246,10 @@ DEFAULT_PRESET_TIMER_SECONDS = 3600
 #   so the newest has to be persisted immediately or a restart comes up unauthenticated.
 #   That makes it the most frequently written key here, and reloading on it would flap every
 #   entity and drop MQTT for nothing.
-# * `CONF_OUTLET_RUN_TIMES` — written whenever the valve announces a `maximumRunTime`, which
-#   it does unprompted and **can do mid-shower**. A reload builds a new coordinator with a
-#   fresh `ZoneCutoffDetector`, so every zone clock restarts at zero while the valve's own
-#   timer keeps running: the exact mechanism by which a run-time cutoff gets missed. This
-#   exclusion matters more than the comparison it is part of.
 # * `CONF_MOBILE_DEVICE_ID` — generated once on first connect, then reused forever.
+# * `CONF_VALVES` — per-valve bookkeeping, such as the remembered warm-up mode.
 RELOAD_IGNORED_DATA_KEYS = frozenset(
-    {CONF_REFRESH_TOKEN, CONF_OUTLET_RUN_TIMES, CONF_MOBILE_DEVICE_ID, CONF_VALVES}
+    {CONF_REFRESH_TOKEN, CONF_MOBILE_DEVICE_ID, CONF_VALVES}
 )
 
 # `RELOAD_IGNORED_OPTION_KEYS` is defined further down, after the warmup constants it
@@ -663,9 +503,8 @@ CONF_LAST_WARMUP_MODE = "last_warmup_mode"
 # write down rather than inherit by accident.
 #
 # ⚠️ **That default is safe but not free, and the warmup pair paid for it.** Both were read
-# live from the first line they existed — `warmup_auto_restore`'s own docstring says "read
-# live from the entry options, *like `restart_on_runtime_cutoff`*, so the switch takes effect
-# immediately" — but neither was ever added here. So until 2026-08-21:
+# live from the entry options from the first line they existed, so a toggle takes effect
+# immediately — but neither was ever added here. So until 2026-08-21:
 #
 # * **Toggling the auto-restore switch reloaded the whole entry.** It writes
 #   `CONF_WARMUP_AUTO_RESTORE`, which fell through to a reload.
@@ -683,7 +522,6 @@ CONF_LAST_WARMUP_MODE = "last_warmup_mode"
 # down.
 RELOAD_IGNORED_OPTION_KEYS = frozenset(
     {
-        CONF_RESTART_ON_RUNTIME_CUTOFF,
         CONF_WARMUP_AUTO_RESTORE,
         CONF_LAST_WARMUP_MODE,
         CONF_REPORT_LOG_FILE,
@@ -729,18 +567,17 @@ WARMUP_AUTO_RESTORE_GIVING_UP = (
 # ---------------------------------------------------------------------------
 # Warmup diagnostic journal
 # ---------------------------------------------------------------------------
-# **Off by default**, like the cutoff journal, and off for the same reason: it was forced on
-# during an investigation and shipped that way through 0.6.7. Built to catch what kept
+# **Off by default.** It was forced on during an investigation and shipped that way through
+# 0.6.7. Built to catch what kept
 # disabling warmup; that question is solved (`docs/gcs/api.md` §3h — the hub's web UI).
 #
 # Worth turning on locally if warm-up is being rewritten by something on your system: it
 # verifies every auto-restore end to end and would be the first thing to notice a different
-# writer. Volume is a handful of records a day, but it shares `CutoffDebugLog`'s missing
-# size cap.
+# writer. Volume is a handful of records a day; `DebugJournal` rolls each file at 8 MB.
 ENABLE_WARMUP_DEBUG_LOG = False
 
-# Unlimited, matching the cutoff journal: this is evidence for an open question, and the
-# whole point is comparing an event to ones weeks earlier.
+# Unlimited: this is evidence for an open question, and the whole point is comparing an
+# event to ones weeks earlier.
 WARMUP_DEBUG_LOG_KEEP_FILES = None
 
 # How much wire traffic to carry in a disable record, either side of the event.

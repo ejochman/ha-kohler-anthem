@@ -34,11 +34,11 @@ from homeassistant.exceptions import (
     ConfigEntryNotReady,
     HomeAssistantError,
 )
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from homeassistant.util import dt as dt_util
 
 from .anthem import (
     MSG_GCS_SOLO_STATUS,
@@ -47,7 +47,7 @@ from .anthem import (
     AnthemMqttStream,
     AuthError,
     AuthUnavailable,
-    CutoffDebugLog,
+    DebugJournal,
     Device,
     DeviceOffline,
     Envelope,
@@ -63,9 +63,7 @@ from .anthem import (
     RawMqttLog,
     ReportLog,
     ValveModel,
-    ZoneCutoff,
-    ZoneCutoffDetector,
-    ZoneReading,
+    ZoneClock,
     describe_topology,
     get_valve_model,
     model_for_topology,
@@ -92,10 +90,8 @@ from .cloud_watch import CloudConnectionWatch
 from .const import (
     CONF_LAST_WARMUP_MODE,
     CONF_MOBILE_DEVICE_ID,
-    CONF_OUTLET_RUN_TIMES,
     CONF_REFRESH_TOKEN,
     CONF_REPORT_LOG_FILE,
-    CONF_RESTART_ON_RUNTIME_CUTOFF,
     CONF_TEMPERATURE_UNIT,
     CONF_TENANT_ID,
     CONF_VALVE_MODEL,
@@ -103,22 +99,14 @@ from .const import (
     CONF_WARMUP_AUTO_RESTORE,
     CONF_WATER_UNITS,
     CONF_ZONE_OUTLETS,
-    CUTOFF_DEBUG_LOG_KEEP_FILES,
     DEFAULT_FLOW_PERCENT,
     DEFAULT_PRESET_ID,
     DEFAULT_PRESET_TIMER_SECONDS,
     DEVICE_NAME_CONTROLLER,
     DEVICE_NAME_VALVE,
     DOMAIN,
-    ENABLE_CUTOFF_DEBUG_LOG,
     ENABLE_RAW_MQTT_LOG,
     ENABLE_WARMUP_DEBUG_LOG,
-    ENDLESS_SHOWER_NOT_SET_UP,
-    ENDLESS_SHOWER_NOTHING_TO_RESTORE,
-    ENDLESS_SHOWER_ON,
-    ENDLESS_SHOWER_RESTARTED,
-    ISSUE_DURATION_MISMATCH,
-    ISSUE_NOT_SET_UP,
     OUTLET_WRITE_VERIFY_DELAY_SECONDS,
     RAW_MQTT_LOG_DIR,
     RAW_MQTT_LOG_KEEP_FILES,
@@ -221,20 +209,6 @@ def entry_reload_signature(entry: ConfigEntry) -> tuple[Any, ...]:
         ignore_data=RELOAD_IGNORED_DATA_KEYS,
         ignore_options=RELOAD_IGNORED_OPTION_KEYS,
     )
-
-
-def describe_duration(run_times: dict[int, int]) -> str:
-    """Max Shower Duration in minutes, the way the Konnect app states it.
-
-    Reads outlet 1 — zone 1's first outlet — because the app presents one duration for the
-    whole system and every install seen has all outlets on the same value. Falls back to the
-    lowest-numbered outlet that has reported, so a partly-learned valve still names a real
-    number instead of nothing.
-    """
-    if not run_times:
-        return "?"
-    seconds = run_times.get(1) or run_times[min(run_times)]
-    return f"{seconds / 60:g}"
 
 
 def _command_half(value: str, field: str) -> str:
@@ -509,53 +483,6 @@ def _device_names(devices: list[Device], base: str) -> dict[str, str]:
     }
 
 
-class _TaggedJournal:
-    """A journal that stamps every record with which valve it is about.
-
-    The cutoff detector writes its own records straight to the journal, without knowing
-    which valve it belongs to. With two valves sharing one file, an untagged `flow_end`
-    would be unattributable. Passthrough when there is no tag, so a single-valve journal is
-    byte-for-byte what it always was and the tools that read it need no change.
-    """
-
-    def __init__(
-        self,
-        journal: Any,
-        tag: str | None,
-        *,
-        report_log: Any = None,
-        kind: str = "",
-        hass: Any = None,
-    ) -> None:
-        self._journal = journal
-        self._tag = tag
-        # The Report Log gets a copy of every decision, so one switch produces one
-        # attachment holding the wire traffic and the reasoning about it, interleaved on one
-        # clock. `kind` is `cutoff` or `warmup` — the two vocabularies reuse event names, so
-        # a reader needs to know which watcher spoke. See `report_log.ReportLog.note`.
-        self._report_log = report_log
-        self._kind = kind
-        self._hass = hass
-
-    def note(self, event: str, **fields: Any) -> None:
-        if self._tag is None:
-            self._journal.note(event, **fields)
-        else:
-            self._journal.note(event, valve=self._tag, **fields)
-        # Independent of the standalone journal above: that one is gated by its own enabled
-        # flag, and a decision must reach an active report whether or not the dedicated
-        # journal is switched on.
-        if self._report_log is not None and self._kind:
-            tagged = dict(fields)
-            if self._tag is not None:
-                tagged["valve"] = self._tag
-            self._report_log.note(self._kind, event, tagged)
-            # `note` never opens a file — the detector runs on the loop, and opening one
-            # there is a blocking call. See `ReportLog.wants_open`.
-            if self._report_log.wants_open and self._hass is not None:
-                self._hass.async_add_executor_job(self._report_log.prepare)
-
-
 def _setting_label(
     maximum_run_time: int | None,
     maximum_temperature_tenths: int | None,
@@ -574,9 +501,9 @@ def _setting_label(
 class Valve:
     """One Anthem digital valve, with everything the coordinator keeps for it.
 
-    The counterpart of :class:`Controller`. Until 2026-09-08 the valve path — state, the
-    run-time cutoff detector, warm-up auto-restore, the cloud reachability watch, the custom
-    shower watcher and the learned limits — lived on the coordinator as singular fields,
+    The counterpart of :class:`Controller`. Until 2026-09-08 the valve path — state,
+    warm-up auto-restore, the cloud reachability watch and the custom shower watcher —
+    lived on the coordinator as singular fields,
     which meant the first valve the account listed and no other. Every one of those things
     is per valve, so they live here, and the coordinator holds a list.
 
@@ -586,9 +513,8 @@ class Valve:
     and the measurements they cite are the valuable part, and rewriting every line to a new
     vocabulary would have put all of it at risk for no behavioural gain.
 
-    **Settings are per valve.** The Endless Shower and Warmup Auto-Restore switches, the
-    remembered warm-up mode and the learned run times used to sit as flat keys on the config
-    entry. They now sit under `CONF_VALVES`, keyed by device id — see `stored` / `option`
+    **Settings are per valve.** The Warmup Auto-Restore switch and the remembered warm-up
+    mode used to sit as flat keys on the config entry. They now sit under `CONF_VALVES`, keyed by device id — see `stored` / `option`
     — and the flat keys are migrated once, at setup, onto the first valve.
     """
 
@@ -606,8 +532,8 @@ class Valve:
         #: so nothing changes for an existing install; see `valve_names`.
         self.name = name
         #: Stamped onto every journal record when the account has several valves, so the
-        #: shared cutoff and warmup journals stay attributable. None keeps a single-valve
-        #: journal exactly as it was.
+        #: shared warmup journal stays attributable. None keeps a single-valve journal
+        #: exactly as it was.
         self.tag = tag
         self.gcs = GcsDevice(
             coordinator.client, device.device_id, coordinator.temperature_unit, model
@@ -617,47 +543,29 @@ class Valve:
         # reports. See `cloud_watch.py`.
         self.cloud_watch = CloudConnectionWatch(coordinator, self)
         #: Everything about the warm-up mode: writing it, watching it, putting it back.
-        #: Its self-write bookkeeping is the same idea as
-        #: `ZoneCutoffDetector.note_local_write`: a change we caused must not be treated as
-        #: the device misbehaving, or turning warmup off from the dropdown would be undone
-        #: a minute later.
+        #: It keeps its own record of what it wrote: a change we caused must not be treated
+        #: as the device misbehaving, or turning warmup off from the dropdown would be
+        #: undone a minute later.
         #: Its own object because it is a closed system — see `warmup_manager`.
         self.warmup = WarmupManager(self)
         # CUSTOM SHOWER: the "No pausing warm-up" watcher, one at a time, and
         # a serial that every command sent from here bumps, so the watcher can tell that
         # something else was sent after its own write. See `anthem/warmup_resume.py`.
         self._custom_shower_task: asyncio.Task | None = None
-        # **Every task this valve starts is held here so `stop()` can cancel it.** Two of
-        # these sleep for a minute or more and then write to the hardware — a warm-up
-        # restore (60 s) and a cutoff restart — so one surviving an unload means an
-        # HTTP write, and a config-entry mutation, from a coordinator Home Assistant has
-        # already discarded. A reload inside that window is enough to trigger it.
+        # **Every task this valve starts is held here so `stop()` can cancel it.** A
+        # warm-up restore sleeps for a minute and then writes to the hardware, so one
+        # surviving an unload means an HTTP write, and a config-entry mutation, from a
+        # coordinator Home Assistant has already discarded. A reload inside that window is enough to trigger it.
         self._background_tasks: set[asyncio.Task] = set()
         self._local_write_serial = 0
         # The raw `gcs-preset` payload from the most recent seed, held only long enough for
         # `_async_sync_default_preset_timer` to consume it. Cleared on use — it feeds a
         # write path, and a stale payload is a silent edit.
         self._seeded_presets: Any = None
-        # Tracks how long each zone has been flowing, so a valve-timer close can be told from
-        # a real stop. Always fed, even with the option off — the cost is a dict update per
-        # message, and it means enabling the option takes effect immediately rather than from
-        # the next time the shower happens to start.
-        self._cutoff = ZoneCutoffDetector()
-        # Last outlet masks seen with water actually running. The valve wipes every mask at
-        # a run-time cutoff, so this is the only record of what to restore.
-        self._last_open_masks: dict[int, int] | None = None
-        # Same idea, for flow. Exists for the zone a preset-off pauses *alongside* the one
-        # that actually hit its limit — `ZoneCutoff.reading` only ever covers the zone whose
-        # own duration matched, so without this the co-paused zone has no flow source and
-        # falls back to `DEFAULT_FLOW_PERCENT` on restore. See `_remember_open_masks`.
-        self._last_open_flows: dict[int, float] | None = None
-        # Per-outlet `maximumRunTime`, keyed by the device's own 0-based `outLetId`.
-        # Restored from the config entry so the cutoff feature works from the first second
-        # after a restart — see `CONF_OUTLET_RUN_TIMES` for why it has to be remembered.
-        self._run_times: dict[int, int] = {
-            int(key): int(value)
-            for key, value in (self.stored(CONF_OUTLET_RUN_TIMES) or {}).items()
-        }
+        # How long each zone has been running, for the time-left attributes. The valve
+        # times each zone against its `maximumRunTime` and reports nothing about the clock,
+        # so this keeps one from the messages. See `anthem/zone_clock.py`.
+        self._zone_clock = ZoneClock()
         # Whether the valve's own outlet split has been read yet — see `async_seed`.
         self._topology_checked = False
         # The `gcs-configuration` record, read once at the first seed. None means "not read
@@ -845,11 +753,7 @@ class Valve:
         return self.coordinator.temperature_unit
 
     @property
-    def cutoff_log(self) -> CutoffDebugLog | None:
-        return self.coordinator.cutoff_log
-
-    @property
-    def warmup_log(self) -> CutoffDebugLog | None:
+    def warmup_log(self) -> DebugJournal | None:
         return self.coordinator.warmup_log
 
     @property
@@ -880,16 +784,6 @@ class Valve:
         """
         outlet = self.model.outlet_from_id(outlet_id)
         return f"id {outlet_id}" if outlet is None else str(outlet)
-
-    @property
-    def issue_id(self) -> str:
-        """The Repairs issue id for an Endless Shower on this valve that cannot act.
-
-        Per valve since 2026-09-08, so two valves raise two cards. The pre-existing id
-        without a device suffix is deleted at setup and unload so an upgrade leaves no
-        orphan.
-        """
-        return f"{ISSUE_NOT_SET_UP}_{self.entry.entry_id}_{self.device_id}"
 
     def _tagged(self, fields: dict[str, Any]) -> dict[str, Any]:
         """Journal fields, stamped with this valve when the account has several."""
@@ -933,21 +827,6 @@ class Valve:
     # ------------------------------------------------------------------ #
     # Lifecycle, driven by the coordinator
     # ------------------------------------------------------------------ #
-    def attach_journal(self, journal: CutoffDebugLog | None) -> None:
-        """Point the cutoff detector at the (shared) debug log, once it exists.
-
-        Also hands it the Report Log, so every cutoff decision reaches an active report
-        alongside the raw traffic that produced it — see `_TaggedJournal`.
-        """
-        if journal is not None:
-            self._cutoff.journal = _TaggedJournal(
-                journal,
-                self.tag,
-                report_log=self.coordinator.report_log,
-                kind="cutoff",
-                hass=self.hass,
-            )
-
     def _note_local_write(self) -> None:
         """Count a command sent from this integration to this valve.
 
@@ -967,8 +846,7 @@ class Valve:
             self.gcs_state.warmup_mode,
             announced=envelope.code == MSG_GCS_WARMUP_STATUS,
         )
-        self._remember_open_masks()
-        self._check_runtime_cutoff()
+        self._update_zone_clock()
         self._note_running_for_usage()
         # A valve message is proof of reachability, and settles any pending
         # contradiction check. CLOUD CONNECTION WATCH.
@@ -1015,8 +893,8 @@ class Valve:
         self.coordinator.async_refresh_entities()
 
     def forget_timings(self) -> None:
-        """Drop the cutoff detector's clocks across a stream gap. See `_handle_connected`."""
-        self._cutoff.forget()
+        """Drop the zone clocks across a stream gap. See `_handle_connected`."""
+        self._zone_clock.forget()
 
     def _track(self, coro) -> asyncio.Task:
         """Start a background task and keep a reference until it finishes.
@@ -1200,7 +1078,6 @@ class Valve:
             )
             return
         self.gcs_state.outlet_limits.update(fresh)
-        self._learn_run_times(self.gcs_state)
 
         wanted = {
             "maximum_run_time": maximum_run_time,
@@ -1358,19 +1235,12 @@ class Valve:
         # second zone, so a valve whose own layout differs from the entry's must have that
         # layout applied before its state is seeded, or a single-zone valve on a two-zone
         # entry starts life with a zone 2 it does not have.
-        # Per-outlet limits, including `maximumRunTime` — the number Endless Shower
-        # cannot act without.
+        # Per-outlet limits, including `maximumRunTime`, come from `gcsadvancestate`.
+        # Over MQTT they arrive only unprompted and one outlet at a time, so this read is
+        # what makes them known from the start.
         #
-        # This used to arrive **only** over MQTT, unprompted and one outlet at a time,
-        # which left a blind window of unknown length after a fresh install: the switch
-        # read "on" while the feature was inert, and the owner was told to go change Max
-        # Shower Duration in the Konnect app purely to provoke an announcement.
-        # `gcsadvancestate` carries the same data and is readable on demand — it was
-        # reachable all along, in a response this integration already fetched for
-        # topology (see `docs/gcs/api.md` §1c, corrected 2026-08-17).
-        #
-        # Runs on every re-seed, not just the first: cheap, and it re-checks the limit
-        # after a reconnect rather than trusting a value that may be hours stale.
+        # Runs on every re-seed, not just the first: cheap, and it re-checks the limits
+        # after a reconnect rather than trusting values that may be hours stale.
         #
         # **The independent reads start here and are awaited at the end.** Only one
         # ordering in this method is real: `gcs-settings` decides the outlet topology, and
@@ -1409,9 +1279,6 @@ class Valve:
             limits = outlet_limits_from_settings(settings)
             if limits:
                 self.gcs_state.outlet_limits.update(limits)
-                # Same path an MQTT announcement takes, so the value is persisted and
-                # the cutoff detector is armed without waiting for the valve to speak.
-                self._learn_run_times(self.gcs_state)
         except KohlerError as err:
             _LOGGER.debug("Could not read outlet limits over REST: %s", err)
 
@@ -1441,41 +1308,6 @@ class Valve:
         except KohlerError as err:
             _LOGGER.debug("Could not seed GCS state: %s", err)
 
-    def announce_readiness(self) -> None:
-        """Say at startup whether the cutoff feature can act — the coordinator's old
-        end-of-setup block, per valve."""
-        # Say at startup whether the cutoff feature can act. The switch keeps its state
-        # across restarts, so without this the only warning would be the one printed when
-        # somebody last toggled it — possibly weeks ago, on a different set of known limits.
-        self._journal(
-            "arm",
-            enabled=self.restart_on_runtime_cutoff,
-            run_times=self.outlet_run_times,
-            awaiting=self.outlets_awaiting_run_time,
-            zone_limits={z: list(v) for z, v in self._zone_limits().items()},
-        )
-        if self.restart_on_runtime_cutoff:
-            if self._run_times:
-                # Stated positively on every start, at WARNING so it shows under default
-                # logging. Silence is ambiguous — "armed" and "the feature quietly stopped
-                # working" look identical from the log — and this is a feature that can
-                # restart water with nobody present, so it should announce itself.
-                _LOGGER.warning(
-                    ENDLESS_SHOWER_ON, describe_duration(self.outlet_run_times)
-                )
-                # No "match the durations" nag here any more — removed 2026-08-22, owner's
-                # decision. It fired on every start of every dual-product install whether or
-                # not the durations differed, which this integration cannot know: the hub's
-                # Max Shower Duration is not readable from the cloud (local API only, and
-                # storing the hub PIN was ruled out). The warning that remains is
-                # evidence-based and one-directional: `runtime_cutoff.py` warns when an
-                # observed minute-boundary stop shows the controller PREEMPTING the valve
-                # (hub limit below the valve's — Endless Shower silently defeated, and the
-                # valve side is the one this integration can write). A controller sweep past
-                # the valve's limit is journalled but not warned: no HA-side action exists.
-            else:
-                _LOGGER.warning(ENDLESS_SHOWER_NOT_SET_UP)
-
     def journal_baseline(self) -> None:
         """Record the mode in force when the warmup journal opened. See the comment inside."""
         # BASELINE: what mode was in force when this file opened, from the REST seed above.
@@ -1504,163 +1336,21 @@ class Valve:
     # ------------------------------------------------------------------ #
     # Moved from the coordinator, 2026-09-08 — bodies unchanged
     # ------------------------------------------------------------------ #
-    @callback
-    def async_refresh_setup_issue(self) -> None:
-        """Raise or clear the Repairs card for an Endless Shower that cannot act.
-
-        Called wherever either half of the condition can change: at setup, when the valve
-        announces a limit, and when the switch is toggled. Idempotent — Home Assistant keeps
-        one issue per id, so re-creating an existing one is a no-op and deleting a missing
-        one is too.
-
-        The condition is `zones_awaiting_run_time`, not "nothing known at all", so a valve
-        that has reported one zone but not the other still raises it. Half-armed is not armed
-        for the zone that has no limit, and that is exactly the silent case worth surfacing.
-        """
-        issue_id = self.issue_id
-        if self.restart_on_runtime_cutoff and self.zones_awaiting_run_time:
-            ir.async_create_issue(
-                self.hass,
-                DOMAIN,
-                issue_id,
-                is_fixable=False,
-                severity=ir.IssueSeverity.WARNING,
-                translation_key=ISSUE_NOT_SET_UP,
-            )
-        else:
-            ir.async_delete_issue(self.hass, DOMAIN, issue_id)
-        # The same moments — a limit learned, the switch toggled — are the ones that can
-        # make the valve's limit match or stop matching a controller's.
-        self.coordinator.async_refresh_duration_issues()
-
     @property
     def outlet_run_times(self) -> dict[int, int]:
-        """Learned `maximumRunTime` per outlet, keyed by **1-based** outlet number.
+        """Each outlet's `maximumRunTime` in seconds, keyed by **1-based** outlet number.
 
-        Empty until the valve announces, which it does unprompted and one outlet at a time.
-        An outlet missing from here cannot be restarted after a cutoff — there is nothing to
-        compare its run length against — so callers that report readiness must consult this
-        rather than assuming the feature is live.
+        Read from the outlet records the seed and MQTT keep current. An outlet whose record
+        has not arrived is simply absent.
         """
+        limits = self.gcs_state.outlet_limits
         result: dict[int, int] = {}
         for outlet in range(1, self.model.total_outlets + 1):
             zone, bit = self.model.outlet_location(outlet)
-            seconds = self._run_times.get(self.model.outlet_id(zone, bit + 1))
-            if seconds is not None:
-                result[outlet] = seconds
+            record = limits.get(self.model.outlet_id(zone, bit + 1))
+            if record is not None and record.maximum_run_time is not None:
+                result[outlet] = record.maximum_run_time
         return result
-
-    @property
-    def armed_zones(self) -> list[int]:
-        """Zones the cutoff feature can actually act on.
-
-        The unit that matters, since the valve times per zone: a zone is armed as soon as
-        *any* of its outlets has reported a `maximumRunTime`, because that is enough to have
-        something to compare the zone's flow duration against. Outlet-level readiness is
-        still reported alongside — it is what the valve announces — but a zone with one
-        known outlet is protected, not half-protected.
-        """
-        return [zone for zone, limits in self._zone_limits().items() if limits]
-
-    @property
-    def zones_awaiting_run_time(self) -> list[int]:
-        """Zones where no outlet has reported a limit yet. Empty means fully armed."""
-        return [zone for zone, limits in self._zone_limits().items() if not limits]
-
-    @property
-    def outlets_awaiting_run_time(self) -> list[int]:
-        """Outlets with no known limit yet, 1-based. Empty means every outlet reported."""
-        known = self.outlet_run_times
-        return [
-            outlet
-            for outlet in range(1, self.model.total_outlets + 1)
-            if outlet not in known
-        ]
-
-    @property
-    def restart_on_runtime_cutoff(self) -> bool:
-        """Whether to re-open an outlet the valve closed on its own run-time limit.
-
-        Read live from the entry options rather than cached, so toggling the checkbox takes
-        effect on the reload without needing a restart. Off unless explicitly enabled.
-        """
-        return bool(self.option(CONF_RESTART_ON_RUNTIME_CUTOFF, False))
-
-    @callback
-    def _remember_open_masks(self) -> None:
-        """Keep the last outlet masks seen while water was actually running.
-
-        **A fallback record of what a cutoff has to be undone with.** When a zone hits its
-        limit the valve does not close one outlet, it clears that zone's whole mask and sets
-        the pause flag in the same message — so by the time the close is detected, the record
-        of what was running has already been destroyed, and rebuilding from current state
-        restores nothing.
-
-        The detector keeps its own per-zone copy of the pre-pause mask, which is more precise
-        and is what the restore prefers. This snapshot still earns its place for the zone the
-        detector did *not* fire on: when a preset drives the shower, the cut pauses every
-        zone the preset owns, and only this has any record of what the un-expired zone was
-        doing (measured 2026-08-13 20:52:46 — zone 2 expired at 3600 s, zone 1 was paused at
-        1831 s).
-
-        **Flow is snapshotted here too, for the same zone.** `ZoneCutoff.reading` only ever
-        covers the zone whose *own* duration matched a limit — the detector never classifies
-        the co-paused zone as a cutoff at all (its duration matches nothing), so it has no
-        reading of its own to hand back. This is the only surviving record of what it was
-        running, same reasoning as the mask.
-
-        Only updated while something is open **and nothing is paused**, which is precisely
-        what makes it survive the cutoff message: an all-closed or paused snapshot never
-        overwrites it, so this always holds the last genuinely-flowing moment for both zones
-        together.
-        """
-        state = self.gcs_state
-        if state is None:
-            return
-        masks = {
-            zone: (word.outlet_mask if word else 0)
-            for zone, word in ((1, state.valve1), (2, state.valve2))
-        }
-        if not any(masks.values()):
-            return
-        if any(word and word.paused for word in (state.valve1, state.valve2)):
-            return
-        self._last_open_masks = masks
-        self._last_open_flows = {
-            zone: word.flow_percent
-            for zone, word in ((1, state.valve1), (2, state.valve2))
-            if word is not None
-        }
-
-    @callback
-    def _learn_run_times(self, state: GcsState) -> None:
-        """Absorb any newly announced `maximumRunTime` and remember it across restarts.
-
-        The valve announces one outlet at a time, unprompted, so this fills in gradually and
-        is the only way the figure can ever be obtained — nothing can ask for it.
-        """
-        learned = {
-            outlet_id: limits.maximum_run_time
-            for outlet_id, limits in state.outlet_limits.items()
-            if limits.maximum_run_time is not None
-        }
-        new = {k: v for k, v in learned.items() if self._run_times.get(k) != v}
-        if not new:
-            return
-        self._run_times.update(new)
-        _LOGGER.info(
-            "Learned run-time limit for outlet(s) %s: %s — the run-time cutoff feature is "
-            "armed for them",
-            ", ".join(self._outlet_label(k) for k in sorted(new)),
-            ", ".join(f"{v}s" for _, v in sorted(new.items())),
-        )
-        self.store(
-            CONF_OUTLET_RUN_TIMES,
-            {str(k): v for k, v in sorted(self._run_times.items())},
-        )
-        # The reason the Repairs card can look after itself: this is the moment the owner's
-        # trip to the Konnect app pays off, and it needs no restart to be noticed.
-        self.async_refresh_setup_issue()
 
     async def _async_sync_default_preset_timer(self) -> None:
         """Take the hidden default preset's own timer out of the way, once.
@@ -1717,36 +1407,18 @@ class Valve:
     def _zone_limits(self) -> dict[int, tuple[int, ...]]:
         """The distinct `maximumRunTime` values configured for each zone's outlets.
 
-        The valve reports this per outlet but **times it per zone** (see
-        `anthem/runtime_cutoff.py`), so there is no single "the" limit for a zone unless
-        its outlets happen to agree.
+        The valve reports this per outlet but **times it per zone**, so there is no single
+        "the" limit for a zone unless its outlets happen to agree.
 
         ⚠️ **They do not always agree — observed 2026-09-10.** One of the owner's two valves
         read 3600 s on all three outlets at 08:38 and then 1800 s on two of them with 3600 s
-        still on the third at 15:22. Until then every outlet on every install seen had
-        matched, and comments here and in `sensor.py` said so as though it were guaranteed.
+        still on the third at 15:22. There is one duration setting; the app writes it one
+        outlet at a time and stops at the first failure, so a dropped call strands the old
+        value on the outlets it never reached. Every distinct value is returned, because the
+        valve really may enforce either.
 
-        **A mixed zone is a lost write, not a configuration.** There is one duration setting;
-        the app writes it one outlet at a time and stops at the first failure
-        (`docs/gcs/api.md`), so a dropped call strands the old value on the outlets it never
-        reached.
-
-        Which makes offering every distinct value as a candidate exactly right, and for a
-        better reason than the one originally written here: the valve really may enforce
-        either number, because its outlets really are holding different ones. Matching any of
-        them keeps such a zone protected, and the cost is a handful of extra 10 s windows in a
-        15-minute session that would each also have to coincide with a `0x40` pause to fire.
-
-        ⚠️ **`maximumRunTime` only. Preset timers are deliberately excluded — do not add
-        them here.** A preset carries its own `time` (`GCS_PRESET_STS`), a *second*
-        independent limit that stops a preset-driven session early whenever it is lower than
-        `maximumRunTime`; this install currently runs a 1800 s preset under a 3600 s hardware
-        gate, so it is the preset that stops the shower. Those stops land as
-        `verdict: "ignored"` with a large `off_by`, and that is the intended outcome: the
-        hardware gate cutting a shower short is what this feature exists to defeat, whereas a
-        preset ending at its own configured duration is the system doing what the user asked.
-        Restarting those would override a setting somebody chose on purpose. Owner's decision,
-        2026-08-17 — see `docs/gcs/api.md`, "two independent timers".
+        `maximumRunTime` only. A preset's own `time` is a second, independent limit that
+        ends a preset-driven session early when it is lower; it is not included here.
         """
         limits: dict[int, set[int]] = {zone: set() for zone in self.model.zones}
         for outlet, seconds in self.outlet_run_times.items():
@@ -1759,243 +1431,27 @@ class Valve:
         return self._zone_limits().get(zone, ())
 
     def zone_flowing_for(self, zone: int) -> float | None:
-        """Seconds this zone has been flowing, from the cutoff detector's own clock.
+        """Seconds this zone has been running, or None when it is idle.
 
-        Fed on every message whether or not the restart option is on, so it is available
-        regardless. None when the zone is idle, or after a reconnect until it next starts.
+        Also None after a reconnect until the zone next starts — see `forget_timings`.
         """
-        return self._cutoff.flowing_for(zone)
+        return self._zone_clock.flowing_for(zone)
 
     @callback
-    def _check_runtime_cutoff(self) -> None:
-        """Re-open a zone the valve closed on its own timer, when the option is on.
+    def _update_zone_clock(self) -> None:
+        """Start or stop each zone's clock from the latest valve words.
 
-        Off unless `restart_on_runtime_cutoff` is enabled — this **defeats a manufacturer
-        cutoff**, and with no resume limit the water keeps coming back for as long as
-        somebody leaves it running. That is the configured intent, not an oversight; the
-        limit question was put to the owner and answered "unlimited". Every resume is logged
-        at WARNING so there is always a record of water having been restarted automatically.
-
-        **Per zone, not per outlet.** The valve's timer starts when a zone begins flowing and
-        is not reset by outlet changes within that zone, so that is what has to be timed.
-        Timing each outlet from its own opening — which this did until 2026-08-14 — fires
-        only when a zone runs one unchanging outlet for the whole session, and misses
-        everything else: 3 of 4 real cutoffs went undetected in the logs that exposed this.
-
-        Temperature carries over because `async_apply_valve` preserves it, and flow follows
-        `DEFAULT_FLOW_PERCENT` like every other write.
-
-        Detection is duration-only and lives in `anthem/runtime_cutoff.py`, which
-        documents why that is sound. Nothing fires without a positive match, and every
-        decision — including every *non*-match — is written to the cutoff debug log.
+        A zone is running when it has outlets open and is not paused (`0x40`), which is how
+        the valve's own timer reads it.
         """
         state = self.gcs_state
         if state is None:
             return
-
-        self._learn_run_times(state)
-        masks: dict[int, int] = {}
-        paused: dict[int, bool] = {}
-        readings: dict[int, ZoneReading] = {}
+        flowing: dict[int, bool] = {}
         for zone in self.model.zones:
             word = state.zone_word(zone)
-            masks[zone] = word.outlet_mask if word else 0
-            paused[zone] = bool(word and word.paused)
-            if word is not None:
-                # Fahrenheit unconditionally, whatever the account displays: this feeds a
-                # diagnostic log that gets read alongside captures from other sessions, and
-                # a unit that changes with a setting makes those incomparable.
-                readings[zone] = ZoneReading(
-                    flow_percent=round(word.flow_percent, 1),
-                    temperature_f=round(word.temperature_celsius * 9 / 5 + 32, 1),
-                )
-
-        fired = self._cutoff.update(masks, paused, self._zone_limits(), readings)
-        if not fired or not self.restart_on_runtime_cutoff:
-            if fired:
-                # Detected but not acted on. Without this line the debug log would show a
-                # `cutoff` verdict and no restore, which reads like a bug rather than the
-                # switch being off.
-                self._journal(
-                    "restore",
-                    skipped="restart_on_runtime_cutoff is off",
-                    zones=[cut.zone for cut in fired],
-                )
-            return
-
-        # Detection and restart used to log a line each. One message now covers both, and it
-        # is emitted only once the water is actually back — so it never claims a restart that
-        # then failed. The cut time is captured here rather than in the restart, which runs a
-        # few seconds later as a task.
-        cut_at = dt_util.now()
-        self._track(self._async_restart_after_cutoff(fired, cut_at))
-
-    @callback
-    def _journal(self, event: str, **fields: Any) -> None:
-        """Write to the cutoff debug log if it exists. No-op before setup finishes.
-
-        This runs on the event loop, so the log deliberately refuses to open a file itself —
-        see `CutoffDebugLog.wants_open`. When it asks for one, the open happens in an
-        executor and the next record lands.
-        """
-        if self.cutoff_log is None:
-            return
-        self.cutoff_log.note(event, **self._tagged(fields))
-        if self.cutoff_log.wants_open:
-            self.hass.async_add_executor_job(self.cutoff_log.prepare)
-
-    async def _async_restart_after_cutoff(
-        self, fired: list[ZoneCutoff], cut_at: Any
-    ) -> None:
-        """Put back exactly what was flowing in the zones the valve cut.
-
-        The valve clears the zone's mask in the same message that reports the cut, so current
-        state says nothing about what the shower was doing. Two independent records survive
-        it — the detector's own pre-pause mask, which is the precise instant before the cut,
-        and `_last_open_masks` as a fallback — and either beats rebuilding from a mask that
-        has already been wiped. Measured live: rebuilding from current state brought a
-        four-outlet shower back as outlet 4 alone.
-
-        **A second zone is restored too, but only if it is also paused.** Normally a cut
-        pauses just the expiring zone and leaves the other's mask untouched — 10 of the 11
-        cutoffs in the corpus. The exception is when a preset is driving the shower: the cut
-        is internally `{preset, action:"Off"}`, so it pauses *every* zone the preset owns,
-        and the zone that did not expire has had its mask wiped just as thoroughly. Its
-        timing proves nothing (1831 s in the one captured instance), so the pause flag is
-        what identifies it.
-
-        A zone that is neither cut nor paused is re-sent exactly as it reads now, so anything
-        changed there in the second between the cut and this write survives.
-
-        **Flow is restored from `cut.reading`, not left to `DEFAULT_FLOW_PERCENT`.** This is
-        deliberately a different rule from `async_apply_valve`'s ordinary writes, which never
-        inherit flow — that rule exists so nothing silently *adopts* the touchscreen's last
-        value on an unrelated write. A restore is not that: it is putting back a value this
-        code itself observed running a moment before it force-closed the zone, which is
-        squarely what "restore" should mean. Measured live 2026-08-14: a preset-driven shower
-        running at 82.5% was cut and had been coming back at 100% — 2.9x on zone 1, which had
-        no outlet open at all. `async_apply_valve` honours whatever flow byte it is given
-        exactly, uncapped and unscaled against any ceiling (verified on hardware; see
-        `docs/gcs/api.md#flow-the-valve-obeys-the-touchscreen-is-what-computes-limits`), so
-        replaying the observed value reproduces the observed experience regardless of whether
-        the valve is calibrated — there is no ceiling to reason about either way. **Covers the
-        `also_paused` zone too**, from `_last_open_flows` — the same snapshot-of-last-resort
-        `_last_open_masks` provides for its mask, and for the same reason: the detector never
-        classifies that zone as a cutoff (its own duration matches nothing), so it has no
-        `ZoneCutoff.reading` to draw on. Falls back to `DEFAULT_FLOW_PERCENT` only when
-        neither source has a value for that zone.
-        """
-        state = self.gcs_state
-        if self.gcs is None or state is None:
-            return
-
-        snapshot = self._last_open_masks or {}
-        flow_snapshot = self._last_open_flows or {}
-        masks: dict[int, int] = {}
-        flows: dict[int, float] = {}
-        also_paused: list[int] = []
-        cut_zones = {cut.zone for cut in fired}
-        for zone in self.model.zones:
-            word = state.zone_word(zone)
-            masks[zone] = word.outlet_mask if word else 0
-            if zone in cut_zones or not (word and word.paused):
-                continue
-            # Paused alongside a cut it did not cause: the preset case above. Only the
-            # snapshot can say what it was doing, since the detector never saw it expire.
-            if snapshot.get(zone):
-                masks[zone] = snapshot[zone]
-                also_paused.append(zone)
-                if zone in flow_snapshot:
-                    flows[zone] = flow_snapshot[zone]
-        for cut in fired:
-            # The detector's mask is authoritative — it is the last mask seen flowing in that
-            # exact zone. `_last_open_masks` covers the case where the detector was fed a
-            # zero mask first (a snapshot ordering quirk), and 0 means "nothing to restore",
-            # which is reported rather than silently sent.
-            restore = cut.mask or snapshot.get(cut.zone, 0)
-            if not restore:
-                _LOGGER.warning(ENDLESS_SHOWER_NOTHING_TO_RESTORE)
-            masks[cut.zone] = restore
-            # The detector's own reading is authoritative for the zone it actually timed —
-            # more precise than the snapshot, same precedence as the mask above.
-            if cut.reading is not None:
-                flows[cut.zone] = cut.reading.flow_percent
-            elif cut.zone in flow_snapshot:
-                flows[cut.zone] = flow_snapshot[cut.zone]
-
-        self._journal(
-            "restore",
-            zones=[cut.zone for cut in fired],
-            also_paused=also_paused,
-            masks=masks,
-            from_detector={cut.zone: cut.mask for cut in fired},
-            from_snapshot=snapshot,
-            was_flow_percent=dict(flows),
-            was_temperature_f={
-                cut.zone: cut.reading.temperature_f
-                for cut in fired
-                if cut.reading is not None
-            },
-            writing_flow_percent={
-                zone: flows.get(zone, DEFAULT_FLOW_PERCENT)
-                for zone in sorted(cut_zones | set(also_paused))
-            },
-            # True when every zone being restored — the cut zone(s) and any also_paused one —
-            # had a captured flow to draw on, so the write below reproduces it exactly. False
-            # means at least one zone had no reading and fell back to DEFAULT_FLOW_PERCENT —
-            # a guess, not a restore.
-            flow_preserved=all(zone in flows for zone in cut_zones | set(also_paused)),
-        )
-        if not any(masks.values()):
-            return
-
-        # Timed because this call, not our own logic, is where a slow restore comes from.
-        # Measured over seven live cutoffs the decision above is a flat 0.4 ms while this
-        # varies 0.64-5.05 s — so the only number worth recording is this one, and it belongs
-        # in the cutoff log rather than `home-assistant.log`, which rotates away.
-        started = time.monotonic()
-        try:
-            await self.async_apply_valve(
-                zone_masks=masks, zone1_flow=flows.get(1), zone2_flow=flows.get(2)
-            )
-        except (KohlerError, HomeAssistantError) as err:
-            # Never retried: a failed restart leaves the water off, which is the safe end
-            # state, and a retry loop against a valve that is refusing is not.
-            _LOGGER.warning("Restart after run-time cutoff failed: %s", err)
-            self._journal(
-                "restore_failed", zones=[cut.zone for cut in fired], error=str(err)
-            )
-            return
-        restored = sorted(
-            outlet
-            for outlet in range(1, self.model.total_outlets + 1)
-            for zone, bit in [self.model.outlet_location(outlet)]
-            if masks.get(zone, 0) >> bit & 1
-        )
-        _LOGGER.warning(ENDLESS_SHOWER_RESTARTED, cut_at.strftime("%H:%M:%S"))
-        self._journal(
-            "restore_done",
-            outlets=restored,
-            write_seconds=round(time.monotonic() - started, 3),
-        )
-        # The valve does not reliably announce a restored zone — 17 of the corpus's 18
-        # restores drew a GCS_SOLO_STS within 0.06-1.08 s, one drew nothing for 176.77 s
-        # while the water ran — and the detector's clock used to start only on that
-        # announcement. An anchor that late reads as "matches no limit" at the next cutoff
-        # and leaves the water off with nothing saying why. The write that just succeeded is
-        # when the water came back, so anchor there; a prompt announcement wins the race
-        # harmlessly (`note_restore` skips zones already timed). Session 12 §3, fixed
-        # 2026-08-22.
-        self._cutoff.note_restore(
-            {
-                zone: masks[zone]
-                for zone in cut_zones | set(also_paused)
-                if masks.get(zone)
-            },
-            readings={
-                cut.zone: cut.reading for cut in fired if cut.reading is not None
-            },
-        )
+            flowing[zone] = bool(word and word.outlet_mask and not word.paused)
+        self._zone_clock.update(flowing)
 
     async def async_apply_valve(
         self,
@@ -2064,18 +1520,7 @@ class Valve:
         else:
             valve2 = UNUSED_VALVE_WORD
 
-        # Mark before sending, with **what** was written. A close that follows our own
-        # *closing* write is ours, not the valve's timer, and must not be undone — otherwise
-        # stopping the shower from Home Assistant near the limit would be read as a timeout
-        # and immediately restarted. An *opening* write gets no such grace: it cannot cause a
-        # close, and pretending it could swallowed a real cutoff on 2026-08-14.
-        #
-        # `paused=True` counts as closing whatever it touches, since the water stops either
-        # way and the valve reports the mask cleared.
         self._note_local_write()
-        self._cutoff.note_local_write(
-            {zone: (0 if paused else mask) for zone, mask in masks.items()}
-        )
         try:
             await self.gcs.async_write_valves(valve1, valve2)
         except DeviceOffline as err:
@@ -2186,22 +1631,7 @@ class Valve:
             decoded["zone2"],
         )
 
-        # Same rule as `async_apply_valve`: only the zones this word actually closes earn the
-        # grace. A raw word is decoded rather than trusted — an undecodable one records
-        # nothing, so a genuine cutoff is still caught.
-        closing: dict[int, int] = {}
-        for zone, word in ((1, word1), (2, word2)):
-            if word == UNUSED_VALVE_WORD:
-                continue
-            try:
-                parsed = decode_word(word)
-            except ValveHexError:  # pragma: no cover - already validated above
-                continue
-            # Not `decoded`: that name is the response built above, and reusing it here
-            # returned the last zone's raw `ValveWord` instead (v0.2.7 and earlier).
-            closing[zone] = 0 if parsed.paused else parsed.outlet_mask
         self._note_local_write()
-        self._cutoff.note_local_write(closing)
         try:
             await self.gcs.async_write_valves(word1, word2)
         except DeviceOffline as err:
@@ -2342,10 +1772,8 @@ class Valve:
         **Why this is not "inherit the valve's flow".** `async_apply_valve` never carries
         flow forward, so that nothing silently adopts whatever the touchscreen last wrote.
         That rule is about the *valve's* byte, not about a value Home Assistant itself
-        holds — the run-time-cutoff restore already makes the same distinction, replaying a
-        flow it observed rather than defaulting. Passing the Flow entity's value is the
-        same case: the user set it, so a subsequent outlet toggle should not silently undo
-        it. The valve's idle byte is still never read here; see `GcsState.flow_is_live` for
+        holds. The Flow entity's value is one the user set, so a subsequent outlet toggle
+        should not silently undo it. The valve's idle byte is still never read here; see `GcsState.flow_is_live` for
         why it cannot be trusted.
         """
         if self.gcs_state is None:
@@ -2383,11 +1811,9 @@ class Valve:
     async def async_restart(self) -> None:
         """Reboot the valve — the app's Restart Product. **Stops any running water.**
 
-        ``valvereset {reset: "productRestart"}``. Recorded as a local write first, so the
-        session ending under it is never mistaken for a run-time cutoff and restarted.
+        ``valvereset {reset: "productRestart"}``.
         """
         self._note_local_write()
-        self._cutoff.note_local_write(dict.fromkeys(self.model.zones, 0))
         try:
             await self.gcs.async_restart()
         except DeviceOffline as err:
@@ -2406,8 +1832,6 @@ class Valve:
         long held that the valve ignores it, on no recorded test.
         """
         self._note_local_write()
-        if not on:
-            self._cutoff.note_local_write(dict.fromkeys(self.model.zones, 0))
         try:
             await self.gcs.async_activate_preset(preset_id, on)
         except DeviceOffline as err:
@@ -2421,28 +1845,12 @@ class Valve:
     async def async_stop_shower(self) -> None:
         """Stop the water: mask byte ``0x00`` on both zones, **not** the ``0x40`` pause.
 
-        This used to pause, which read nicely as "Paused" in the status sensor. It was
-        changed on 2026-08-13 because **a pause is indistinguishable from the valve's own
-        run-time cutoff** — the cutoff is internally ``{preset, action:"Off"}`` and writes
-        exactly the same ``0x40``. With the restart-on-cutoff option enabled, Home Assistant
-        turning the shower off and the valve timing out looked identical on the wire, leaving
-        only `note_local_write()`'s 30 s grace between "stopped" and "helpfully restarted".
-
-        ✅ **The strong guarantee is back, 2026-08-18: a stop issued from here can never be
-        undone by Endless Shower.** The detector requires the ``0x40`` pause flag again, and
-        this method writes ``0x00``, so its stops are outside the restart-eligible set
-        entirely — by shape, not by timing.
-
-        The requirement was briefly dropped on 2026-08-17, when a real cutoff arrived as
-        ``0x00`` and was ignored. Five case studies established that as **two maximum
-        durations set to different values** rather than a protocol gap: only the GCS valve
-        cuts with ``0x40`` and only the Anthem Plus controller with ``0x00``, the valve fires
-        marginally early and the controller marginally late, so with the two durations equal
-        the pause always arrives first. See `anthem/runtime_cutoff.py` and
-        `docs/case_studies/`.
-
-        `note_local_write()`'s 30 s grace still applies and is now belt-and-braces rather than
-        the only protection.
+        Konnect 3.0.6 stops with ``0x40`` (the pause bit, no outlets); the Anthem Plus
+        controller stops with ``0x00``. Both leave the valve idle. This used to pause, and
+        moved to ``0x00`` on 2026-08-13 so that a stop from Home Assistant could never be
+        mistaken for the valve's own run-time cutoff, which also pauses. Endless Shower,
+        which needed that distinction, was removed on 2026-10-08; ``0x00`` stays because it
+        is the form verified live from here.
 
         Still routed through `async_apply_valve` rather than `GcsDevice.async_turn_off()`,
         which would write a flat 38.0 °C to both zones — this preserves each zone's own
@@ -2578,9 +1986,8 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # milliseconds later and would seed the identical state all over again. See
         # `_async_update_data`.
         self._seeded_during_setup = False
-        # CUTOFF DEBUG LOG: built in `async_setup`, once `hass.config.path` is usable.
-        self.cutoff_log: CutoffDebugLog | None = None
-        self.warmup_log: CutoffDebugLog | None = None
+        # WARMUP JOURNAL: built in `async_setup`, once `hass.config.path` is usable.
+        self.warmup_log: DebugJournal | None = None
         # Rolling record of recent messages, so a warmup disable can be journalled
         # with what surrounded it. Bounded by count and trimmed by age on read.
         self._recent_messages: deque = deque(maxlen=WARMUP_CONTEXT_MAX_MESSAGES)
@@ -2608,10 +2015,10 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not valves and not controllers:
             raise ConfigEntryNotReady("No Anthem devices on this account")
 
-        # Every valve, not the first one. Each carries its own state, cutoff detector,
-        # warm-up restore, cloud watch and settings — see `Valve`. The settings move
-        # first, so the first valve's `Valve.__init__` finds its learned run times where
-        # they now live rather than where the single-valve versions left them.
+        # Every valve, not the first one. Each carries its own state, zone clock, warm-up
+        # restore, cloud watch and settings — see `Valve`. The settings move first, so the
+        # first valve finds them where they now live rather than where the single-valve
+        # versions left them.
         if valves:
             self._migrate_valve_settings(valves[0].device_id)
         names = valve_names(valves)
@@ -2714,23 +2121,9 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if episode:
             await self.hass.async_add_executor_job(self.report_log.resume, episode)
 
-        # CUTOFF DEBUG LOG: same directory as the raw capture on purpose — the two are read
-        # together, joined on `ts`. See `anthem/cutoff_log.py`.
-        self.cutoff_log = CutoffDebugLog(
-            self.hass.config.path(RAW_MQTT_LOG_DIR),
-            forced=ENABLE_CUTOFF_DEBUG_LOG,
-            keep_files=CUTOFF_DEBUG_LOG_KEEP_FILES,
-        )
-        for valve in self.valves:
-            valve.attach_journal(self.cutoff_log)
-        await self.hass.async_add_executor_job(self.cutoff_log.prepare)
-
-        # WARMUP JOURNAL: a second journal in the same directory, on the same clock, for a
-        # different open question — see `WARMUP_README`. Separate from the cutoff log because
-        # the two are read for different reasons and `pause_resolution.py` and friends glob
-        # `cutoff_*.jsonl`; mixing warmup records into that corpus would silently change what
-        # those tools count.
-        self.warmup_log = CutoffDebugLog(
+        # WARMUP JOURNAL: in the same directory as the raw capture, on the same clock, so
+        # the two interleave — see `WARMUP_README`.
+        self.warmup_log = DebugJournal(
             self.hass.config.path(RAW_MQTT_LOG_DIR),
             forced=ENABLE_WARMUP_DEBUG_LOG,
             keep_files=WARMUP_DEBUG_LOG_KEEP_FILES,
@@ -2768,17 +2161,10 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if credential_is_dead(err):
                 self._handle_auth_error(err)
 
-        # The Repairs card used to be keyed by entry alone; it is per valve now, and an
-        # upgrade must not leave the old one standing. Deleting a missing issue is a no-op.
-        ir.async_delete_issue(
-            self.hass, DOMAIN, f"{ISSUE_NOT_SET_UP}_{self.entry.entry_id}"
-        )
         for valve in self.valves:
-            valve.announce_readiness()
             # Arms trigger B's countdown. Nothing is asked of Kohler until the valve has
             # actually been quiet for the full interval, and any valve message resets it.
             valve.cloud_watch.async_start()
-            valve.async_refresh_setup_issue()
 
         # FIRMWARE: once now, in the background so setup does not wait on it, then every
         # `FIRMWARE_CHECK_INTERVAL`. Release availability is the one thing no message
@@ -2793,7 +2179,6 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Move the flat per-valve keys under `CONF_VALVES`, once.
 
         Before 2026-09-08 the entry held one valve's worth of settings as flat keys —
-        `CONF_OUTLET_RUN_TIMES` in data; `CONF_RESTART_ON_RUNTIME_CUTOFF`,
         `CONF_WARMUP_AUTO_RESTORE` and `CONF_LAST_WARMUP_MODE` in options. They belong to
         whichever valve that install had, which on an account that has just grown a second
         one is the first the cloud lists. Copied under that device id and removed, so there
@@ -2801,39 +2186,24 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Every key involved is reload-ignored, so this write does not bounce the entry.
         """
-        data = dict(self.entry.data)
         options = dict(self.entry.options)
-        moved_data = {
-            key: data.pop(key) for key in (CONF_OUTLET_RUN_TIMES,) if key in data
-        }
         moved_options = {
             key: options.pop(key)
-            for key in (
-                CONF_RESTART_ON_RUNTIME_CUTOFF,
-                CONF_WARMUP_AUTO_RESTORE,
-                CONF_LAST_WARMUP_MODE,
-            )
+            for key in (CONF_WARMUP_AUTO_RESTORE, CONF_LAST_WARMUP_MODE)
             if key in options
         }
-        if not moved_data and not moved_options:
+        if not moved_options:
             return
-        if moved_data:
-            valves = dict(data.get(CONF_VALVES) or {})
-            valves[device_id] = {**moved_data, **(valves.get(device_id) or {})}
-            data[CONF_VALVES] = valves
-        if moved_options:
-            valves = dict(options.get(CONF_VALVES) or {})
-            valves[device_id] = {**moved_options, **(valves.get(device_id) or {})}
-            options[CONF_VALVES] = valves
-        self.hass.config_entries.async_update_entry(
-            self.entry, data=data, options=options
-        )
+        valves = dict(options.get(CONF_VALVES) or {})
+        valves[device_id] = {**moved_options, **(valves.get(device_id) or {})}
+        options[CONF_VALVES] = valves
+        self.hass.config_entries.async_update_entry(self.entry, options=options)
         # No device id: this is INFO, and an id is a cloud address (see 0.9.0). The
         # migration targets the first valve the cloud lists and runs once, so naming the
         # keys is the whole of what a reader needs.
         _LOGGER.info(
             "Moved per-valve settings (%s) under the first valve on the account",
-            ", ".join(sorted([*moved_data, *moved_options])),
+            ", ".join(sorted(moved_options)),
         )
 
     @callback
@@ -2921,8 +2291,6 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.stream = None
         # The raw capture is closed by the stream's own teardown; this one has no stream to
         # ride on, so it is released here. Blocking close — off the loop.
-        if self.cutoff_log is not None:
-            await self.hass.async_add_executor_job(self.cutoff_log.close)
         if self.warmup_log is not None:
             await self.hass.async_add_executor_job(self.warmup_log.close)
 
@@ -3083,6 +2451,7 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 self._apply_controller_topology(controller, configuration)
             controller.settings = HubSettings.from_configuration(configuration)
+            self._async_link_controller_page(controller)
         except KohlerError as err:
             _LOGGER.debug("Could not read HUB configuration for %s: %s", device_id, err)
         # The firmware's fixed experience catalogue, once. A failure leaves it empty and
@@ -3129,7 +2498,25 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug("No HUB favorites are saved on %s", device_id)
             else:
                 _LOGGER.debug("Could not read HUB favorites for %s: %s", device_id, err)
-        self.async_refresh_duration_issues()
+
+    @callback
+    def _async_link_controller_page(self, controller: Controller) -> None:
+        """Point the controller's device page at its web settings page.
+
+        The entity's `DeviceInfo` sets it when the device is first created; this keeps it
+        current when the controller's address changes, since each seed re-reads it. Cosmetic,
+        so registry trouble is logged and stepped over rather than failing the seed.
+        """
+        url = controller.settings.web_url
+        try:
+            registry = dr.async_get(self.hass)
+            device = registry.async_get_device(
+                identifiers={(DOMAIN, controller.device_id)}
+            )
+            if device is not None and device.configuration_url != url:
+                registry.async_update_device(device.id, configuration_url=url)
+        except Exception as err:  # A link is not worth failing a seed over.
+            _LOGGER.debug("Could not update the controller's web page link: %s", err)
 
     @callback
     def _apply_controller_topology(
@@ -3400,53 +2787,6 @@ class KohlerAnthemCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 controller.device_id, "hub"
             )
         self.async_refresh_entities()
-
-    @callback
-    def async_refresh_duration_issues(self) -> None:
-        """Raise or clear "the two Max Shower Durations differ", per controller.
-
-        The rule `runtime_cutoff` depends on is *match the durations*: with them equal the
-        valve's restorable ``0x40`` pause always lands first; with the controller's longer,
-        its ``0x00`` can end a shower Endless Shower is keeping alive. Until 2026-10-07 the
-        controller's number was thought unreadable, so this could not be checked.
-
-        Raised only on evidence: Endless Shower on for a valve, that valve's limits known,
-        the controller's duration read, and the two different. Which controller fronts which
-        valve is not knowable from the cloud, so every pairing is compared — on the usual
-        account there is one of each.
-        """
-        if self.hass is None:
-            return
-        for controller in self.controllers:
-            issue_id = f"{ISSUE_DURATION_MISMATCH}_{controller.device_id}"
-            minutes = controller.settings.max_shower_duration_minutes
-            mismatch = None
-            if minutes:
-                for valve in self.valves:
-                    if not valve.restart_on_runtime_cutoff:
-                        continue
-                    limits = set(valve.outlet_run_times.values())
-                    if limits and limits != {minutes * 60}:
-                        mismatch = (valve, max(limits))
-                        break
-            if mismatch is None:
-                ir.async_delete_issue(self.hass, DOMAIN, issue_id)
-                continue
-            valve, seconds = mismatch
-            ir.async_create_issue(
-                self.hass,
-                DOMAIN,
-                issue_id,
-                is_fixable=False,
-                severity=ir.IssueSeverity.WARNING,
-                translation_key=ISSUE_DURATION_MISMATCH,
-                translation_placeholders={
-                    "controller": controller.name,
-                    "controller_minutes": str(minutes),
-                    "valve": valve.name,
-                    "valve_minutes": str(round(seconds / 60)),
-                },
-            )
 
     async def async_stop_hub(self, controller: Controller) -> None:
         """Stop everything the controller is running — water, steam, music, lighting.

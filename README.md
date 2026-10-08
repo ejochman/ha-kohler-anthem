@@ -43,8 +43,6 @@ interact when combined.
 ### Highlights
 
 * **Per-outlet control** — every outlet is its own switch, in both zones.
-* **Endless Shower** — re-open a zone the moment the valve closes it on its own run-time
-  limit, so a shower doesn't stop on its own.
 * **Live outlet and temperature** — move a setpoint or flip an outlet and the water follows
   immediately. No scene to apply, no confirm step.
 * **Every valve on the account** — one device per Anthem valve and per controller, each with

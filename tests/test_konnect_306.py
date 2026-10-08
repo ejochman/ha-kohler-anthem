@@ -435,65 +435,6 @@ def test_steam_will_not_start_while_the_controller_runs_the_shower():
 
 
 # --------------------------------------------------------------------------- #
-# The duration cross-check
-# --------------------------------------------------------------------------- #
-def test_differing_durations_raise_a_repairs_card_and_matching_ones_clear_it(
-    monkeypatch,
-):
-    from custom_components.kohler_anthem import coordinator as module
-    from custom_components.kohler_anthem.anthem.hub import HubSettings
-
-    created: list = []
-    deleted: list = []
-    monkeypatch.setattr(
-        module.ir, "async_create_issue", lambda *a, **k: created.append((a, k))
-    )
-    monkeypatch.setattr(module.ir, "async_delete_issue", lambda *a: deleted.append(a))
-
-    controller = SimpleNamespace(
-        device_id="hub-x",
-        name="Anthem Plus",
-        settings=HubSettings(max_shower_duration_minutes=60),
-    )
-    valve = SimpleNamespace(
-        name="Anthem Valve",
-        restart_on_runtime_cutoff=True,
-        outlet_run_times={1: 900, 2: 900},
-    )
-    coordinator = module.KohlerAnthemCoordinator.__new__(module.KohlerAnthemCoordinator)
-    coordinator.hass = object()
-    coordinator.controllers = [controller]
-    coordinator.valves = [valve]
-
-    coordinator.async_refresh_duration_issues()
-    assert created and created[0][1]["translation_placeholders"] == {
-        "controller": "Anthem Plus",
-        "controller_minutes": "60",
-        "valve": "Anthem Valve",
-        "valve_minutes": "15",
-    }
-
-    created.clear()
-    valve.outlet_run_times = {1: 3600, 2: 3600}
-    coordinator.async_refresh_duration_issues()
-    assert not created and deleted
-
-
-def test_the_duration_issue_has_text_in_every_language():
-    import json
-    import pathlib
-
-    root = pathlib.Path("custom_components/kohler_anthem")
-    files = [root / "strings.json", *sorted((root / "translations").glob("*.json"))]
-    for path in files:
-        issue = json.loads(path.read_text(encoding="utf-8"))["issues"][
-            "durations_differ"
-        ]
-        for placeholder in ("{controller}", "{valve}", "{controller_minutes}"):
-            assert placeholder in issue["description"], (path, placeholder)
-
-
-# --------------------------------------------------------------------------- #
 # New entities
 # --------------------------------------------------------------------------- #
 def test_the_update_entity_offers_a_release_only_when_the_cloud_does():
@@ -602,3 +543,47 @@ def test_the_daily_water_sensor_counts_how_often_the_shower_ran():
         if e.name == "Water Used Today"
     )
     assert sensor.extra_state_attributes["times_turned_on"] == 3
+
+
+# --------------------------------------------------------------------------- #
+# The controller's web settings page
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("hub", "ip", "url"),
+    [
+        ({"wlan": {"ip": "192.168.1.40"}}, "192.168.1.40", "http://192.168.1.40/"),
+        # A wired controller: no Wi-Fi address, so Ethernet's.
+        (
+            {"wlan": {"ip": ""}, "eth": {"ip": "10.0.0.7"}},
+            "10.0.0.7",
+            "http://10.0.0.7/",
+        ),
+        ({"wlan": {"ip": "fd00::5"}}, "fd00::5", "http://[fd00::5]/"),
+        ({"wlan": {"ip": "0.0.0.0"}}, None, None),
+        ({"wlan": {"ip": "null"}}, None, None),
+        ({}, None, None),
+    ],
+)
+def test_the_controller_address_becomes_its_web_page(hub, ip, url):
+    from custom_components.kohler_anthem.anthem.hub import HubSettings
+
+    settings = HubSettings.from_configuration({"about": {"hub": hub}})
+    assert settings.lan_ip == ip
+    assert settings.web_url == url
+
+
+def test_the_controller_device_links_to_its_web_page():
+    from custom_components.kohler_anthem.anthem.hub import HubSettings
+
+    model = _model()
+    controller = make_controller(model)
+    controller.settings = HubSettings(lan_ip="192.168.1.40")
+    coordinator = make_coordinator([make_valve(model, [31, 11, 1])], [controller])
+    entities = [
+        e
+        for e in collect("binary_sensor", coordinator)
+        if e.unique_id.startswith("hub")
+    ]
+    assert entities
+    for entity in entities:
+        assert entity.device_info["configuration_url"] == "http://192.168.1.40/"

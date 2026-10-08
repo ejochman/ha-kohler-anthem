@@ -36,17 +36,9 @@
     }
   },
   "issues": {
-    "endless_shower_not_set_up": {
-      "title": "Douche infinie attend votre vanne",
-      "description": "Douche infinie est activée, mais Home Assistant n'a pas encore pu lire la limite de durée de la douche depuis votre vanne, et ne peut donc pas relancer votre douche.\n\n**Aucune action n'est nécessaire.** La limite est normalement lue pendant la configuration, et Douche infinie s'arme dès qu'elle arrive. Ce message disparaît de lui-même.\n\nS'il persiste après quelques minutes, la vanne est injoignable : vérifiez qu'elle est bien en ligne dans l'application Kohler Konnect, puis rechargez l'intégration."
-    },
     "outlet_write_unverified": {
       "title": "Un réglage de la douche n'a peut-être pas été appliqué",
       "description": "Home Assistant a demandé à votre vanne de modifier **{setting}**, et la vanne a accepté la demande — mais la relecture de la valeur ensuite n'a pas montré le changement.\n\n{detail}\n\n**Ce que cela signifie.** L'API de Kohler répond « accepté pour livraison », jamais « appliqué », c'est pourquoi cette vérification existe pour détecter la différence. Le réglage a peut-être encore l'ancienne valeur.\n\n**Que faire.** Ouvrez l'entité et redéfinissez-la. Si cela échoue une seconde fois, vérifiez que la vanne est en ligne dans l'application Kohler Konnect — une vanne déconnectée du cloud accepte des commandes qui ne l'atteignent jamais.\n\nCe message disparaît lorsqu'un changement est vérifié."
-    },
-    "durations_differ": {
-      "title": "Vos deux durées maximales de douche diffèrent",
-      "description": "Douche infinie est activée pour **{valve}**, dont la limite de durée de douche est de **{valve_minutes} minutes**, mais **{controller}** arrête la douche après **{controller_minutes} minutes**.\n\n**Pourquoi c'est important.** Douche infinie relance la douche quand la limite de la vanne la met en pause. Si la limite du contrôleur est différente, le contrôleur peut arrêter la douche avec sa propre minuterie, et cet arrêt ne peut pas être annulé.\n\n**Que faire.** Réglez les deux sur la même valeur : celle de la vanne dans l'application Kohler Konnect (réglages de douche → durée maximale de douche) ou avec le contrôle Max Shower Duration de cette intégration, et celle du contrôleur sur sa propre page de réglages. Ce message disparaît une fois qu'elles correspondent — la valeur du contrôleur est relue quand Home Assistant se reconnecte à Kohler."
     }
   }
 }

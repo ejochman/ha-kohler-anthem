@@ -280,8 +280,7 @@ class WarmupManager:
     def auto_restore(self) -> bool:
         """Whether to put the warmup mode back after something else disables it.
 
-        Read live from the entry options, like `restart_on_runtime_cutoff`, so the switch
-        takes effect immediately. Off unless explicitly enabled.
+        Read live from the entry options, so the switch takes effect immediately. Off unless explicitly enabled.
         """
         return bool(self._valve.option(CONF_WARMUP_AUTO_RESTORE, False))
 

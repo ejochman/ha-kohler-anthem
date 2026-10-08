@@ -34,11 +34,8 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
-    CONF_RESTART_ON_RUNTIME_CUTOFF,
     CONF_WARMUP_AUTO_RESTORE,
     DOMAIN,
-    ENDLESS_SHOWER_NOT_SET_UP,
-    ENDLESS_SHOWER_ON,
     OUTLET_TYPE_NAMES,
     OUTLET_TYPE_VARIANTS,
     SHOWER_ON_PRESET_ID,
@@ -46,12 +43,7 @@ from .const import (
     WARMUP_AUTO_RESTORE_NO_TARGET,
     WARMUP_AUTO_RESTORE_ON,
 )
-from .coordinator import (
-    Controller,
-    KohlerAnthemCoordinator,
-    Valve,
-    describe_duration,
-)
+from .coordinator import Controller, KohlerAnthemCoordinator, Valve
 from .entity import (
     KohlerControllerEntity,
     KohlerValveEntity,
@@ -164,7 +156,6 @@ async def async_setup_entry(
     for valve in coordinator.valves:
         model = valve.model
         entities.append(ShowerSwitch(coordinator, valve))
-        entities.append(EndlessShowerSwitch(coordinator, valve))
         # ONLY WHERE THE FAULT CAN OCCUR. The single identified cause of a spontaneous
         # `warmUpDisabled` is the Anthem Plus controller's web UI writing it as a fixed step
         # of its signed-in routine — hub firmware, with the valve merely the recipient. On a
@@ -205,12 +196,9 @@ class ShowerSwitch(KohlerValveEntity, SwitchEntity):
     **Off stops the system**, sending mask byte ``0x00`` on both zones while each zone keeps
     its own temperature — see ``async_stop_shower()``.
 
-    It used to *pause* (``0x40``), which showed as "Paused" in the status sensor and reads
-    better on a dashboard. That was given up on 2026-08-13 for a concrete reason: **a pause
-    is byte-identical to the valve's own run-time cutoff**, which is internally
-    ``{preset, action:"Off"}``. With the restart-on-cutoff option on, "Home Assistant stopped
-    the shower" and "the valve timed out" were the same event on the wire, separated only by
-    a 30 s grace window. Stopping with ``0x00`` makes them different by construction.
+    It used to *pause* (``0x40``), which showed as "Paused" in the status sensor. It moved
+    to ``0x00`` on 2026-08-13 so a stop could never be mistaken for the valve's own run-time
+    cutoff, which also pauses; see ``async_stop_shower()`` for why it stays.
 
     **On activates preset ``SHOWER_ON_PRESET_ID``** — one call, no valve write. The valve has
     no "run my default", so a whole-shower start has to name a stored scene; the preset
@@ -287,128 +275,6 @@ class ShowerSwitch(KohlerValveEntity, SwitchEntity):
             self._optimistic = None
             self.async_write_ha_state()
             raise
-
-
-class EndlessShowerSwitch(KohlerValveEntity, SwitchEntity):
-    """Whether to re-open a zone the valve closed on its own run-time limit.
-
-    **This switch is the only control for the feature.** It began life alongside a
-    config-flow checkbox writing the same option; the checkbox was removed 2026-08-22
-    (see `config_flow.py`) because a setting buried behind *Configure* is neither visible
-    on the device page nor reachable from an automation or a dashboard, and the switch is
-    all three.
-
-    **What it does when on:** the valve shuts a zone off once it has been running for
-    `maximumRunTime` (15 minutes here, per zone rather than per outlet — see
-    `anthem/runtime_cutoff.py`); this re-opens the outlets that were running so the
-    shower carries on. It therefore **defeats a manufacturer cutoff, with no limit on
-    repeats** — water keeps coming back for as long as somebody leaves it running, and the
-    hardware stop is the thing being overridden. That is the owner's deliberate choice; see
-    `CONF_RESTART_ON_RUNTIME_CUTOFF` in `const.py`. Every restart is logged at WARNING, and
-    every decision, including the declines, goes to the cutoff debug log.
-
-    ⚠️ **On an account with BOTH an Anthem valve and an Anthem Plus controller, the two Max
-    Shower Durations must be set to the same value.** They are separate timers on separate
-    devices and they signal differently — the valve **pauses** (`0x40`), the controller
-    **stops** (`0x00`) — and this feature acts on the pause, because that is the only cut it
-    can tell apart from somebody deliberately ending their shower. Measured across five case
-    studies (`docs/case_studies/`), the valve fires marginally early and the controller
-    marginally late, so with equal durations the valve always cuts first and there is always a
-    pause to act on. **If the controller's is shorter, it stops the shower and nothing
-    restarts it.** Since 2026-08-22 that mismatch is warned about only on evidence — a
-    minute-boundary stop showing the controller preempting the valve (`runtime_cutoff.py`) —
-    not nagged unconditionally at toggle or startup: the hub's number is not readable from
-    the cloud, so the integration cannot know whether the durations differ until one fires.
-
-    State lives in the config entry's **options**, per valve under `CONF_VALVES`, so the
-    setting survives a restart.
-    Writing options does not trigger a reload — the key is in `RELOAD_IGNORED_OPTION_KEYS`
-    and `_async_update_listener` sees no reloadable difference — and the coordinator reads
-    the flag live, so a toggle takes effect on the next message rather than needing a
-    restart.
-    """
-
-    _attr_name = "Endless Shower"
-    _attr_icon = "mdi:timer-refresh-outline"
-    _attr_entity_category = EntityCategory.CONFIG
-
-    def __init__(self, coordinator: KohlerAnthemCoordinator, valve: Valve) -> None:
-        super().__init__(coordinator, valve)
-        self._attr_unique_id = f"{self._device_id}_keep_water_running"
-
-    @property
-    def available(self) -> bool:
-        """A setting, not a reading — usable even before any valve state has arrived."""
-        return self.coordinator.last_update_success
-
-    @property
-    def is_on(self) -> bool:
-        return self._valve.restart_on_runtime_cutoff
-
-    async def async_turn_on(self, **kwargs: Any) -> None:
-        await self._async_set(True)
-
-    async def async_turn_off(self, **kwargs: Any) -> None:
-        await self._async_set(False)
-
-    async def _async_set(self, value: bool) -> None:
-        self._valve.set_option(CONF_RESTART_ON_RUNTIME_CUTOFF, value)
-        if value:
-            self._log_enabled_state()
-        else:
-            _LOGGER.info("Endless Shower disabled")
-        # Turning it off clears the Repairs card as well as raising it — an unusable feature
-        # nobody has switched on is not a problem worth a card.
-        self._valve.async_refresh_setup_issue()
-        self.async_write_ha_state()
-
-    def _log_enabled_state(self) -> None:
-        """Say plainly, at switch-on, whether this can actually do anything yet.
-
-        Turning it on is not enough: a zone also needs a `maximumRunTime` from at least one
-        of its outlets, which arrives only on an unprompted `READ_GCS_OUTLET_CONFIG_CFG` and
-        cannot be requested. Until then the switch reads "on" while the feature is inert — a
-        silent no-op that is indistinguishable from a broken one, and the exact thing that
-        made an early test of this look like nothing was happening.
-
-        Reported by zone, because that is what the valve times, with the outlet detail kept
-        alongside since that is the form the valve announces it in.
-        """
-        waiting = self._valve.zones_awaiting_run_time
-        known = self._valve.outlet_run_times
-
-        if not known:
-            _LOGGER.warning(ENDLESS_SHOWER_NOT_SET_UP)
-            return
-
-        if waiting:
-            # Partly armed is reported the same way as not armed at all: from the owner's
-            # side the situation and the remedy are identical, and naming the zones that
-            # did report would only invite trusting a half-armed feature.
-            _LOGGER.warning(ENDLESS_SHOWER_NOT_SET_UP)
-            return
-
-        _LOGGER.warning(ENDLESS_SHOWER_ON, describe_duration(known))
-        # The "match the durations" nag that used to follow here (and on every start) was
-        # removed 2026-08-22 — see the note beside ENDLESS_SHOWER_ON in `coordinator.py`:
-        # the mismatch warning is evidence-based now, and fires only when the controller is
-        # observed preempting the valve.
-
-    @property
-    def extra_state_attributes(self) -> dict[str, object]:
-        """Readiness, visible without going to the log.
-
-        `armed_zones` empty while the switch is on means the feature is on but inert — the
-        zone is the unit that matters, since the valve's timer is per zone.
-        """
-        known = self._valve.outlet_run_times
-        return {
-            "armed_zones": self._valve.armed_zones,
-            "awaiting_run_time_limit_zones": self._valve.zones_awaiting_run_time,
-            "armed_outlets": sorted(known),
-            "run_time_limits_seconds": {str(k): v for k, v in sorted(known.items())},
-            "awaiting_run_time_limit": self._valve.outlets_awaiting_run_time,
-        }
 
 
 class WarmupAutoRestoreSwitch(KohlerValveEntity, SwitchEntity):
@@ -502,8 +368,7 @@ class WarmupAutoRestoreSwitch(KohlerValveEntity, SwitchEntity):
         if not value:
             _LOGGER.info("Warmup Auto-Restore disabled")
         elif self._valve.last_warmup_mode is None:
-            # On but inert, which is indistinguishable from broken unless it says so — the
-            # same failure mode Endless Shower's readiness logging exists to prevent.
+            # On but inert, which is indistinguishable from broken unless it says so.
             _LOGGER.warning(WARMUP_AUTO_RESTORE_NO_TARGET)
         else:
             _LOGGER.warning(

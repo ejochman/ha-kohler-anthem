@@ -448,9 +448,8 @@ class ValveZoneActiveSensor(KohlerValveEntity, BinarySensorEntity):
 
     **"Active" means flowing, which is not the same as "has outlets assigned".** A paused
     valve keeps its assignment in byte 3 — `0x41` is "paused, outlet 1 still assigned" — but
-    no water comes out. This reads the same definition the run-time cutoff detector uses:
-    a non-empty mask *and* not paused. Anything else would make the two disagree on screen
-    about the state one of them is acting on.
+    no water comes out. This reads the same definition the zone clock uses: a non-empty
+    mask *and* not paused, which is how the valve's own run-time timer reads it.
 
     **Not diagnostic.** It was, with an `enabled by default` override to undo the half of
     that categorisation that would have hidden it — which is the shape of a miscategorised
@@ -486,9 +485,9 @@ class ValveZoneActiveSensor(KohlerValveEntity, BinarySensorEntity):
         """Enough to see *why* it reads as it does, and how close a cutoff is.
 
         `seconds_remaining` is the useful one during a shower. It is None when the limit is
-        unknown, when the zone is idle, or after a reconnect — the detector drops its timings
-        across a gap rather than reporting a duration it cannot stand behind, and this shows
-        that honestly instead of substituting a zero.
+        unknown, when the zone is idle, or after a reconnect — the zone clocks are dropped
+        across a gap rather than reporting a duration they cannot stand behind, and this
+        shows that honestly instead of substituting a zero.
         """
         word = self._word
         if word is None:

@@ -36,17 +36,9 @@
     }
   },
   "issues": {
-    "endless_shower_not_set_up": {
-      "title": "Endlosdusche wartet auf deine Armatur",
-      "description": "Endlosdusche ist aktiviert, aber Home Assistant konnte das Zeitlimit der Dusche noch nicht von deiner Armatur auslesen und kann die Dusche daher nicht neu starten.\n\n**Es ist keine Aktion erforderlich.** Das Limit wird normalerweise während der Einrichtung gelesen, und Endlosdusche aktiviert sich selbst, sobald es eintrifft. Diese Meldung verschwindet von selbst.\n\nWenn sie nach ein paar Minuten immer noch angezeigt wird, ist die Armatur nicht erreichbar – überprüfe, ob sie in der Kohler-Konnect-App online ist, und lade die Integration dann neu."
-    },
     "outlet_write_unverified": {
       "title": "Eine Duscheinstellung wurde möglicherweise nicht angewendet",
       "description": "Home Assistant hat deine Armatur gebeten, **{setting}** zu ändern, und die Armatur hat die Anfrage angenommen – aber beim anschließenden erneuten Auslesen des Werts wurde die Änderung nicht angezeigt.\n\n{detail}\n\n**Was das bedeutet.** Die API von Kohler antwortet mit „zur Zustellung angenommen“, niemals mit „angewendet“, daher dient diese Prüfung dazu, den Unterschied zu erkennen. Die Einstellung hat möglicherweise noch den alten Wert.\n\n**Was zu tun ist.** Öffne die Entität und stelle sie erneut ein. Wenn es ein zweites Mal fehlschlägt, überprüfe, ob die Armatur in der Kohler-Konnect-App online ist – eine Armatur, die die Verbindung zur Cloud verloren hat, nimmt Befehle an, die sie nie erreichen.\n\nDiese Meldung verschwindet, sobald eine Änderung bestätigt wird."
-    },
-    "durations_differ": {
-      "title": "Deine beiden maximalen Duschzeiten unterscheiden sich",
-      "description": "Endlosdusche ist für **{valve}** aktiviert, deren Duschzeitlimit **{valve_minutes} Minuten** beträgt, aber **{controller}** beendet eine Dusche nach **{controller_minutes} Minuten**.\n\n**Warum das wichtig ist.** Endlosdusche startet die Dusche neu, wenn das Limit der Armatur sie pausiert. Ist das Limit des Controllers ein anderes, kann der Controller die Dusche stattdessen mit seinem eigenen Timer beenden, und dieses Ende lässt sich nicht rückgängig machen.\n\n**Was zu tun ist.** Stelle beide auf denselben Wert: die der Armatur in der Kohler Konnect App (Duscheinstellungen → maximale Duschdauer) oder mit der Steuerung „Max Shower Duration“ dieser Integration, und die des Controllers auf seiner eigenen Einstellungsseite. Diese Meldung verschwindet, sobald beide übereinstimmen — der Wert des Controllers wird neu gelesen, wenn sich Home Assistant wieder mit Kohler verbindet."
     }
   }
 }

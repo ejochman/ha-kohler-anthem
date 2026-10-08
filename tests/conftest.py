@@ -176,14 +176,11 @@ def make_valve(model, types, *, device_id="gcs-test0001", run_time=1800):
         created_time="2024-03-11T14:22:31Z",
         firmware="00.74",
         zone_flow={zone: 100.0 for zone in model.zones},
-        restart_on_runtime_cutoff=False,
-        # **1-based**, matching `Valve.outlet_run_times` — which maps its 0-based internal
-        # store up by one. This fixture used `range()` and so handed entities 0-based keys
+        # **1-based**, matching `Valve.outlet_run_times` — which maps the valve's 0-based
+        # `outLetId` up by one. This fixture used `range()` and so handed entities 0-based keys
         # no real valve ever produces, which hid an off-by-one in the Max Shower Duration
         # attributes for as long as it existed.
         outlet_run_times={i + 1: run_time for i in range(model.total_outlets)},
-        armed_zones=list(model.zones),
-        zones_awaiting_run_time=[],
         warmup_auto_restore=False,
         last_warmup_mode=None,
         zone_flowing_for=lambda zone: None,

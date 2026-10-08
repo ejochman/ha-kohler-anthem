@@ -1,61 +1,29 @@
-"""Decision log for the run-time cutoff detector — why it fired, and why it didn't.
+"""A JSONL debug journal written beside the raw MQTT capture. Off by default.
 
-# =====================================================================
-# CUTOFF DEBUG LOG — diagnostic, OFF BY DEFAULT, safe to delete wholesale
-# =====================================================================
-#
-# Searching for this later? The markers are:
-#
-#   grep -rn "CUTOFF DEBUG LOG" custom_components/kohler_anthem/
-#
-# That finds this module, the constants in `const.py`, the call sites in
-# `anthem/runtime_cutoff.py` and `coordinator.py`, and the roll button.
-# Removing those blocks removes the feature completely.
-#
-# =====================================================================
+One writer, parameterised by file prefix and README, so a journal is a few lines to add.
+Today it serves one: the **warmup journal** (`warmup_*.jsonl`), which records every change
+to the valve's warmup mode with the traffic around it — see `WARMUP_README` below. Until
+2026-10-08 it also wrote the run-time cutoff decision log for Endless Shower, which has
+been removed.
 
-The cutoff detector is the one piece of this integration that turns water back **on** by
-itself, and its inputs are invisible after the fact: durations are measured against a
-monotonic clock in memory, and the valve destroys the outlet mask in the same message that
-reports the close. When it misbehaves, `home-assistant.log` shows only the outcome — a
-WARNING if it fired, and *nothing at all* if it should have fired and didn't. Silence is the
-failure mode that matters, and silence is exactly what a normal log cannot record.
+Records stamp `ts` as ISO-8601 UTC with a `Z` suffix, the same clock and format as
+`mqtt_raw_*.jsonl` in the same directory, so the two interleave by sorting on it.
 
-So this writes the detector's whole decision trail: every zone that starts or stops flowing,
-every close it evaluated, the duration and limits it compared, and the verdict with a reason.
+Switching it on:
 
-## Reading it alongside the raw MQTT capture
-
-Both logs live in the **same directory** and stamp `ts` in the **same format** — ISO-8601
-UTC with a `Z` suffix, taken from the same clock. So the two interleave directly:
-
-    cd /config/kohler_anthem_raw
-    jq -c '{ts, src:"mqtt", code:(.payload|fromjson|.data.code)}' mqtt_raw_*.jsonl \
-      > /tmp/a.jsonl
-    jq -c '{ts, src:"cutoff", event, zone, verdict, reason}' cutoff_*.jsonl > /tmp/b.jsonl
-    sort -m -t'"' -k4 /tmp/a.jsonl /tmp/b.jsonl | less
-
-The pairing to look for is a `GCS_SOLO_STS` in the raw log whose valve word carries `0x40`,
-and the `flow_end` record written in the same instant. If the raw log shows the pause and
-the cutoff log shows `verdict: "ignored"`, the `reason` and `duration` fields say precisely
-why — which is the question that took a full capture corpus to answer the first time.
-
-Switching it on works exactly like the raw capture, and independently of it:
-
-* **From the UI, no restart** — Developer Tools → Actions → `logger.set_level`, YAML mode:
+* **Permanently** — the journal's `ENABLE_*` constant in `const.py`
+  (`ENABLE_WARMUP_DEBUG_LOG`).
+* **From the UI, no restart** — Developer Tools → Actions → `logger.set_level`:
 
       action: logger.set_level
       data:
-        custom_components.kohler_anthem.anthem.cutoff_log: debug
+        custom_components.kohler_anthem.anthem.journal: debug
 
-* **Permanently** — set `ENABLE_CUTOFF_DEBUG_LOG = True` in `const.py`.
+Volume is a handful of lines per shower. Files are one per Home Assistant run, each capped
+at `max_bytes`, and pruned to the newest `keep_files`.
 
-Volume is low — a handful of lines per shower, versus one per MQTT message — so leaving it
-on across days costs almost nothing. Files are one per Home Assistant run, pruned to the
-newest `keep_files`.
-
-Thread safety: the detector runs on the event loop, but `note()` is cheap and the lock makes
-it safe from the paho thread too, matching `RawMqttLog`.
+Thread safety: callers run on the event loop, but `note()` is cheap and the lock makes it
+safe from the paho thread too, matching `RawMqttLog`.
 """
 
 from __future__ import annotations
@@ -80,73 +48,6 @@ _SWITCH_LOGGER = _LOGGER
 # Matches `RAW_MQTT_LOG_MAX_BYTES`. See `_max_bytes` for why a cap exists at all.
 DEFAULT_MAX_BYTES = 8 * 1024 * 1024
 DEFAULT_KEEP_FILES: int | None = None
-
-_README = """\
-Run-time cutoff decision log — written by the kohler_anthem integration.
-
-Each .jsonl file is one Home Assistant run, one JSON object per line. Every
-record has:
-
-    ts       ISO-8601 UTC — the SAME clock and format as mqtt_raw_*.jsonl in
-             this directory, so the two files interleave by sorting on it
-    event    flow_start | flow_end | restore | arm | anchor
-
-`anchor` (since 2026-08-22) is a restore starting a zone's clock itself: the valve
-does not reliably republish a restored zone (176.77 s of silence in the measured
-case), so the clock now starts at the restore write rather than waiting for a
-message. A flow_start for that zone will NOT follow — the anchor took its place.
-
-`flow_end` is the interesting one. It carries the detector's full reasoning:
-
-    zone       the valve zone that stopped flowing
-    duration   seconds it had been flowing, monotonic
-    limits     the maximumRunTime values it was compared against
-    mask       the outlet mask that was flowing just before it stopped
-    paused     whether the zone carried the 0x40 pause flag
-    verdict    "cutoff" or "ignored"
-    reason     why, when ignored
-
-`flow_start`, `mask_change`, `setting_change` and `flow_end` also carry what the
-shower was actually delivering at that moment:
-
-    flow_percent     0-100, from the valve word
-    temperature_f    degrees FAHRENHEIT always, whatever the account displays,
-                     so captures from different accounts stay comparable
-
-`setting_change` fires when flow or temperature moved while the outlets did not —
-which is what the touchscreen adjusting a dial mid-shower looks like.
-
-On a `restore`, compare `was_flow_percent` against `writing_flow_percent`.
-`flow_preserved: false` means at least one cut zone had no captured reading, so it
-came back at `DEFAULT_FLOW_PERCENT` instead of its own prior value — the fallback,
-not the normal case. `true` means every cut zone's flow was replayed exactly as it
-was running before the cut.
-
-To correlate with the raw MQTT capture, look for the GCS_SOLO_STS message
-whose valve word has 0x40 in byte 3 at the same `ts` as a flow_end record.
-
-This log is OFF by default. Right now it is on because:
-
-{why}
-
-{keep_desc} Delete them freely — pure diagnostics.
-"""
-
-_WHY_FORCED = """\
-    ENABLE_CUTOFF_DEBUG_LOG = True
-
-in the integration's const.py, which pins it on across restarts.
-
-TO STOP IT: set that constant back to False and restart Home Assistant.
-`logger.set_level` will NOT turn it off while the constant is True."""
-
-_WHY_LOGGER = """\
-    custom_components.kohler_anthem.anthem.cutoff_log
-
-is set to debug. To stop it, call `logger.set_level` with that same logger
-name set to `info` — no restart needed. This does not survive a restart; set
-ENABLE_CUTOFF_DEBUG_LOG = True in const.py to keep it on."""
-
 
 WARMUP_README = """\
 Kohler Anthem — warmup journal
@@ -237,8 +138,8 @@ Set ENABLE_WARMUP_DEBUG_LOG = False in const.py and restart Home Assistant Core.
 """
 
 
-class CutoffDebugLog:
-    """Append cutoff-detector decisions to a JSONL file, when switched on."""
+class DebugJournal:
+    """Append diagnostic records to a JSONL file, when switched on."""
 
     def __init__(
         self,
@@ -246,17 +147,17 @@ class CutoffDebugLog:
         *,
         forced: bool = False,
         keep_files: int | None = DEFAULT_KEEP_FILES,
-        prefix: str = "cutoff",
-        readme: str | None = None,
+        prefix: str,
+        readme: str,
         readme_fields: dict[str, Any] | None = None,
-        label: str = "Cutoff debug log",
+        label: str,
         max_bytes: int = DEFAULT_MAX_BYTES,
     ) -> None:
         """`prefix` names the files and scopes pruning; `readme` is the note left beside them.
 
-        Parameterised 2026-08-20 so the warmup journal can reuse this writer rather than
-        copy it. Pruning matches on the prefix, so two journals in one directory never
-        delete each other's files.
+        Pruning matches on the prefix, so two journals in one directory never delete each
+        other's files. `readme` is a `str.format` template; it may use `{keep_desc}` and
+        any key in `readme_fields`.
         """
         self._directory = directory
         self._forced = forced
@@ -293,8 +194,8 @@ class CutoffDebugLog:
     def wants_open(self) -> bool:
         """True when a record arrived with no file open, so :meth:`prepare` should be called.
 
-        Unlike `RawMqttLog`, this log is written from the **event loop** — the detector runs
-        there. Opening a file and creating a directory are blocking calls that must not
+        Unlike `RawMqttLog`, this log is written from the **event loop**, where its callers
+        run. Opening a file and creating a directory are blocking calls that must not
         happen on it, so `note()` never opens one; it raises this flag instead and the caller
         schedules `prepare()` in an executor. The cost is that the first record after
         switching capture on mid-session is dropped, which matters far less than the flag it
@@ -330,7 +231,7 @@ class CutoffDebugLog:
         }
         # Rounded on the way in: these are seconds measured off a monotonic clock, and
         # sixteen significant figures of float noise makes the log harder to read for no
-        # gain. Two decimals still resolves the 0.2 s jitter the tolerance is sized against.
+        # gain.
         for key, value in fields.items():
             record[key] = round(value, 2) if isinstance(value, float) else value
 
@@ -387,9 +288,8 @@ class CutoffDebugLog:
                 encoding="utf-8",
             ) as fh:
                 fh.write(
-                    (self._readme or _README).format(
+                    self._readme.format(
                         **self._readme_fields,
-                        why=_WHY_FORCED if self._forced else _WHY_LOGGER,
                         keep_desc=(
                             "No limit on the number of files — every one is kept."
                             if self._keep_files is None
@@ -441,7 +341,7 @@ class CutoffDebugLog:
             try:
                 self._open_locked()
             except OSError as err:
-                _LOGGER.warning("Could not start a new cutoff debug log: %s", err)
+                _LOGGER.warning("%s could not start a new file: %s", self._label, err)
                 return None
             return self._path
 

@@ -25,7 +25,7 @@ All are under `/devices/api/v1/device-management/`.
 | `hub-experience/{id}/favorites` | `favorites[] {id, title, isExperience, water, steam, music, light, …}`. **404 when no favorites are saved**, not an empty list | live |
 | `hub-experience/{id}/experiences` | `experiences {showerExperiences[], steamExperiences[], iceShowerExperiences[]}`, each item `{id, title, state, isActive, duration, experienceDurationMinutes/Seconds, description, isExperienceInError}` | app |
 | `hub-diagnostics/{id}` (GET/DELETE), `hub-diagnostics/{id}/active` | Fault log / active faults, see [platform §8](platform.md#8-diagnostics-fault-logs) | app |
-| `hub-usage/{id}` | See [platform §6](platform.md#6-water-usage); also adds max/min hot inlet temperature | app |
+| `hub-usage/{id}` | See [platform §6](platform.md#6-water-usage). `AnthemHubWaterUsageModel`: buckets in `anthemHubUsageDataDetailsList[] {intervalKey, volume, onDuration, averageBlendTemperature, maximumHotInletTemperature, minimumHotInletTemperature}` — no per-bucket switch-on count. Summary fields are `avg`/`min`/`max` of `Volume`, `OnDuration`, `AverageBlendTemperature`, `MaximumHotInletTemperature` and `MinimumHotInletTemperature`, plus `maxNumberOfTimesValveSwitchedOn`. **The app charts only volume and on-time**; it never displays the inlet temperatures, so their unit is unknown. The water is the same water the valve's `gcs-usage` counts | app |
 
 Favorite names arrive under **two different keys**: REST `title`, MQTT `FAVORITES_SNAPSHOT` `name`. Read both. Favorite ids are **reassigned when a favorite is deleted**, so always resolve by name (live).
 
@@ -39,7 +39,7 @@ Favorite names arrive under **two different keys**: REST `title`, MQTT `FAVORITE
 | `lightSettings[]` | `name` (`groupA`/`groupB`/`groupC`), `icon`, `color`, `hue`, `brightness`, `saturation`, `multiColor` (false = white only), `connectivity` (`"No"` = unreachable) |
 | `about` | `hub {wlan {ip, …}, eth, mac, ssid, signalstrength, …}`, `valve1`/`valve2 {serialNumber, firmware, …}` and others. A valve that isn't fitted has serial `0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0` |
 
-**Max Shower Duration is readable here.** The Anthem integration long believed it was local-API-only. It matters because Endless Shower needs the controller's and the valve's durations to match (see `anthem/runtime_cutoff.py`). Whether the cloud copy follows an edit made on the controller promptly is unverified: REST has been seen to lag on `monoVolume`.
+**Max Shower Duration is readable here.** The Anthem integration long believed it was local-API-only. The controller times each zone against it independently of the valve's own `maximumRunTime`, stops with `0x00` when it expires, and whichever limit is shorter ends the shower ([gcs_valve.md §4.1](gcs_valve.md#41-run-time-limit)). Whether the cloud copy follows an edit made on the controller promptly is unverified: REST has been seen to lag on `monoVolume`.
 
 ### 2.2 "Fitted but disconnected" (the app's rules, `nc0/z.java` `k()`)
 
@@ -152,9 +152,11 @@ Konnect 3.0.6 never calls this API. It opens the controller's page (the "Embedde
 | Shower switch (`valvecontrol`), System switch (`stopall`), favorite select | ✅ |
 | Steam switch (`steamcontrol`), with the shower-and-steam guard | ✅ app-confirmed only |
 | Experience select (catalogue + `*_EXP_STS`) | ✅ app-confirmed only |
-| Max Shower Duration sensor + duration-mismatch repair issue | ✅ |
+| Max Shower Duration sensor | ✅ |
 | Problem sensor: error flags, active errors, fitted-but-disconnected accessories | ✅ |
 | Per-group light state; steam detail and `POWERCLEAN` | ✅ |
 | Firmware update entity (read-only) | ✅ |
 | Favorite create/edit/delete (library methods exist, aligned with 3.0.6; no UI) | ⚠️ library only |
-| hub-usage, LAN IP discovery, light colour/brightness control (no command exists) | ❌ documented only |
+| Device page link to the web settings page (`about.hub.wlan.ip`, else `about.hub.eth.ip`) | ✅ app-confirmed only |
+| hub-usage: not built. Its volumes repeat the valve's, the inlet temperatures have no known unit, and no controller owner has run a live read yet | ❌ documented only |
+| Light colour/brightness control (no command exists) | ❌ |

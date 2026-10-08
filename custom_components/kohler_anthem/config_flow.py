@@ -90,9 +90,8 @@ class KohlerAnthemConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
     # No options flow, deliberately — removed 2026-08-22 on the owner's decision. Its one
-    # option duplicated the Endless Shower switch, which is the better control (visible on
-    # the device page, reachable from automations and dashboards), and the flow carried a
-    # latent bug besides: saving it replaced the entry's options wholesale with its single
+    # option duplicated a switch on the device page (Endless Shower, itself removed
+    # 2026-10-08), which is the better control, and the flow carried a latent bug besides: saving it replaced the entry's options wholesale with its single
     # key, which would have wiped the stored warmup keys the moment anyone used Configure.
     # The entities that persist to `entry.options` still do; only the dialog is gone.
 
@@ -294,5 +293,4 @@ class KohlerAnthemConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 # `KohlerAnthemOptionsFlow` stood here until 2026-08-22 — see the note in the config
-# flow class above for why it went and what replaced it (nothing needed to: the Endless
-# Shower switch was already the real control).
+# flow class above for why it went.

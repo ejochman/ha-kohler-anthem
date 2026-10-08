@@ -112,7 +112,7 @@ All are under `/platform/api/v1/commands/gcs/`. Every body starts `{deviceId, sk
 |---|---|---|
 | Open outlets | `solowritesystem` with the full words: outlet bits, temperature and flow for both zones | live |
 | Stop | **The app writes byte 3 = `0x40`**: the pause bit, no outlets, bit 7 clear. It sets the per-valve pause bit and zeroes the outlets (`db0/c.java`; the older screens do the same) | app |
-| Stop, `0x00` | Mask `0x00` with a valid prefix also stops. **The Anthem integration deliberately keeps `0x00`**: the valve's own run-time cutoff also produces a `0x40` pause, so a `0x00` stop is the one shape that can never be mistaken for a cutoff (see `anthem/runtime_cutoff.py`) | live |
+| Stop, `0x00` | Mask `0x00` with a valid prefix also stops. The Anthem Plus controller stops this way, and so does the Anthem integration: a `0x00` stop can never be mistaken for the valve's own run-time cutoff, which pauses with `0x40` (§4.1) | live |
 | Broken stop | An all-zero `primaryValve1` (prefix `0x00`) addresses no valve and is **ignored** — the "can turn on but never off" bug in other libraries | live |
 | Full cold | Temperature `0` °C: the valve stops mixing in hot water. The app's slider has a `COLD` stop one below the minimum that sends this | app + live |
 
@@ -146,6 +146,22 @@ All are under `/platform/api/v1/commands/gcs/`. Every body starts `{deviceId, sk
 | Max Shower Duration | 15, 20, 25, 30, 45, 60 min (newer); 15-30 (older); written as minutes × 60 | 3.0.1 misread anything above 30 min as 25; fixed in 3.0.5 |
 
 `deviceconfig.properties` in the APK (`maxFahrenheitValve2 = 100`, and so on) holds placeholders that GCS code never reads. The app overwrites them with the valve's own `maximumOutletTemperature`.
+
+### 4.1 Run-time limit
+
+How the valve's Max Shower Duration (`maximumRunTime`) actually ends a shower. All **live**, from 156 zone sessions captured 2026-08-07 to 08-14 (spanning a change from 3600 s to 900 s) and five later case studies.
+
+- **Set per outlet, timed per zone.** The clock starts when a zone goes from nothing flowing to something flowing. It **does not reset** when outlets change within the zone: opening a second head, closing the first or swapping between them leaves it running. Timing each outlet separately misses most cutoffs in sessions where someone moves between heads.
+- **A zone is "flowing"** when its word has outlet bits set and the `0x40` pause bit clear.
+- **At the limit the valve pauses that zone**: byte 3 becomes `0x40` and the outlet bits are cleared in the same message. Nothing else marks it as a timeout: `currentSystemState` stays `normalOperation`.
+- **It fires slightly early**: −0.08 to −0.23 s against the limit. All 11 cutoffs in the corpus landed within 1.32 s of a limit. No other pause came within 334 s of one, and no `0x00` stop within 123 s.
+- **A preset-driven session pauses every zone the preset owns** when one of them expires, not only that zone.
+- **The outlets of one zone can disagree.** The app writes the duration one outlet at a time and stops at the first failure, so a lost write strands the old value on the rest (seen 2026-09-10: 1800 s on two outlets, 3600 s on the third).
+- **Three limits can end a shower, and the shortest wins:**
+  - the valve's `maximumRunTime`, which pauses (`0x40`);
+  - the **Anthem Plus controller's** own `maxShowerDuration` ([hub_controller.md](hub_controller.md)), also timed per zone, which **stops** (`0x00`) and fires slightly late (+0.20 to +1.00 s);
+  - a **preset's `time`** (§3.3), for a session that preset started.
+- **Who stops how:** the valve's timer, the Konnect app and the first-generation touchscreen use `0x40` (the touchscreen on both zones). The controller and the Anthem integration use `0x00`. So a `0x40` pause near the limit cannot be told apart from an app stop at the same moment.
 
 ## 5. Warmup
 
@@ -226,7 +242,9 @@ The shapes and install flow are in [platform §7](platform.md#7-firmware). The c
 | Capability | Status |
 |---|---|
 | Outlet switches, zone temperature (`COLD` to max) and flow, `custom_shower`, `send_valve_hex` | ✅ |
-| Presets (start), Endless Shower, warmup, outlet settings (12-key write) | ✅ |
+| Presets (start), warmup, outlet settings (12-key write) | ✅ |
+| Time-left attributes (zone clock against `maximumRunTime`, §4.1) | ✅ |
+| Endless Shower (restart a shower the valve's timer ended) | removed 2026-10-08 |
 | Experiences (start/stop via `controlpresetorexperience`) | ✅ app-confirmed only |
 | Restart (`valvereset`) | ✅ app-confirmed only, disabled by default |
 | Firmware update entities (read-only) | ✅ |

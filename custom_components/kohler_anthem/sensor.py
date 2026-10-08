@@ -136,8 +136,8 @@ async def async_setup_entry(
         # Diagnostic, and about the controller's *reporting* rather than the water, so it is
         # created for every controller — unlike everything gated below.
         entities.append(ControllerLastUpdateSensor(coordinator, controller))
-        # The controller's own cap on a shower — what Endless Shower needs to match. Read
-        # from `hub-configuration`, so created for every controller.
+        # The controller's own cap on a shower. Read from `hub-configuration`, so created
+        # for every controller.
         entities.append(ControllerMaxShowerDurationSensor(coordinator, controller))
 
         if controller_water:
@@ -245,10 +245,10 @@ class ValveStatusSensor(KohlerValveEntity, SensorEntity):
                 else None
             ),
         }
-        attributes.update(self._cutoff_countdown())
+        attributes.update(self._time_left())
         return attributes
 
-    def _cutoff_countdown(self) -> dict[str, object]:
+    def _time_left(self) -> dict[str, object]:
         """How long water has been running, and how long before the valve cuts it off.
 
         **Moved here from `Shower Active` in 0.19.0**, which a single-zone valve no longer
@@ -261,8 +261,8 @@ class ValveStatusSensor(KohlerValveEntity, SensorEntity):
         per-zone figures on `Shower Active`, which is where "which zone" gets answered.
 
         None — never 0 — when the limit is unknown, when nothing is flowing, or after a
-        reconnect: the detector drops its timings across a gap rather than reporting a
-        duration it cannot stand behind, and a zero would read as "cutoff imminent".
+        reconnect: the zone clocks are dropped across a gap rather than reporting a duration
+        they cannot stand behind, and a zero would read as "cutoff imminent".
         """
         flowing: list[float] = []
         remaining: list[float] = []
@@ -1003,13 +1003,13 @@ class ControllerMaxShowerDurationSensor(ControllerDiagnosticSensor):
 
     From ``hub-configuration`` ``systemSettings.maxShowerDuration`` — readable from the
     cloud, which this integration did not know until Konnect 3.0.6 showed the app reading it
-    (2026-10-07). It is the number Endless Shower needs to match the valve's own limit; when
-    they differ the integration raises a Repairs card, and this is where to read the
-    controller's side. Re-read on each reconnect, not live: an edit on the controller shows
-    here after the next one.
+    (2026-10-07). The controller times a shower independently of the valve's own Max
+    Shower Duration, and whichever is shorter ends it, so this explains a shower that stops
+    earlier than the valve's setting says. Re-read on each reconnect, not live: an edit on
+    the controller shows here after the next one.
 
     Enabled by default, unlike the other controller diagnostics, because it is a setting
-    someone has to act on rather than a protocol curiosity.
+    someone may need to act on rather than a protocol curiosity.
     """
 
     _attr_name = "Max Shower Duration"

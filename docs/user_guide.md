@@ -68,7 +68,6 @@ the broker replays nothing when you connect, so the state has to come from somew
   favorites are both exposed as dropdowns.
 * **Warmup.** Kohler's pre-heat feature as a three-option dropdown, with an optional watchdog
   that puts it back when something silently turns it off.
-* **Endless Shower.** Optionally re-open a zone the valve closed on its own run-time limit.
 * **One-command shower.** A `custom_shower` action: choose outlets and temperatures, and it
   goes to the valve as a single command — the form to use from an automation, because the valve
   cannot take two commands back to back. Optionally keeps the shower on past the valve's
@@ -137,8 +136,7 @@ the account, and an **Anthem Plus** for each controller.
 
 **Several of either.** An account with more than one valve or controller — one per
 bathroom, say — gets one device per unit, each with the full set of entities, its own
-favorites and settings (Endless Shower, Warmup Auto-Restore and the learned run-time
-limits are per valve), and each decoding outlets with the layout its own hardware reports,
+favorites and settings (Warmup Auto-Restore is per valve), and each decoding outlets with the layout its own hardware reports,
 so a 6-outlet valve and a 3-outlet valve on one account each get the right rows. To keep
 their entity IDs apart, the devices are named after the unit's name in the Konnect app:
 **Anthem Valve Master Bath**, **Anthem Plus Guest Bath**, and so on. With a single valve
@@ -183,7 +181,6 @@ position: `Outlet 1`, or `Outlet 2.1` on a multi-zone valve.
 | `Favorite` | select | Presets **stored on the valve**, added in the Konnect app or at the first-generation touchscreen |
 | `Experience` | select | The valve's stored **experiences** (Wake Up, Cool Down…), added in the Konnect app. Started with the same command the app uses — new in this release and not yet tried on hardware; see [Favorites and presets](#favorites-and-presets) |
 | `Warmup` | select | Off / All outlets / Selected outlets |
-| `Endless Shower` | switch | Re-open a zone the valve closed on its run-time limit |
 | `System Status` | sensor | `Water Running`, `Paused`, `Warming Up`, `Idle`. Whole-valve: warm-up and pause are system-level, not per-zone. Carries `seconds_remaining` — how long before the valve's run-time limit closes the water |
 | `System State` | sensor | The valve's own `normalOperation` / `showerInProgress` flag — a second opinion to `System Status`, decoded differently. Also `error` and `FirmwareUpdate`, which the Konnect app acts on but no install has yet been seen to send |
 | `At Temperature` | binary sensor | Whether the water has reached its setpoint |
@@ -268,8 +265,14 @@ reading.
 | `Experience` | select | The controller's experiences — shower, steam and ice-shower programs such as Breathe, Focus or Detox — started and shown running. They run from zone 1's first outlet, as the app notes |
 | `Music` / `Light` / `Steam` | binary sensor | Accessory state. `Light` carries each light group's own state; `Steam` carries temperature, timers and `power_clean` (the generator's self-clean) |
 | `Problem` | binary sensor | A fault the controller reports, an active error (its title and code are attributes), or an accessory that is set up but has stopped responding — "Steam is disconnected", an SD card missing — the cases the app shows as error cards |
-| `Max Shower Duration` | sensor | The controller's own limit on a shower, in minutes. Endless Shower needs it to match the valve's — see [Endless Shower](#endless-shower) |
+| `Max Shower Duration` | sensor | The controller's own limit on a shower, in minutes. The shorter of this and the valve's `Max Shower Duration` ends a shower — see [Shower time limits](#shower-time-limits) |
 | `Firmware` | update | Installed and latest controller firmware, checked twice a day. Read-only |
+
+The controller's device page also has a **Visit** link to its own web settings page — where its
+Max Shower Duration and other settings are changed — using the network address Kohler's
+cloud reports for it. New in this release and not yet tried on a real controller: if the
+address isn't reported, there's simply no link. Signing in to that page turns the valve's
+warmup off; `Warmup Auto-Restore`, if it's on, puts it back.
 
 <details>
 <summary><b>Diagnostic entities</b> — mostly disabled by default, for protocol work rather than daily use</summary>
@@ -597,26 +600,22 @@ will not fire on a restatement after a reboot, it stops after five restores that
 stick, it never writes while water is running, and it does nothing unless it has previously
 seen the mode enabled.
 
-### Endless Shower
+### Shower time limits
 
-The valve enforces a maximum run time per outlet and closes the zone when it's reached. With
-this switch on, the integration re-opens the zone with the same outlets and temperature,
-producing a shower that doesn't stop on its own.
+The valve turns the water off once a zone has run for its **Max Shower Duration** — 15, 20,
+25, 30, 45 or 60 minutes, set with the valve's `Max Shower Duration` dropdown or in the
+Konnect app. The timer runs per zone and keeps counting when you switch between outlets in
+that zone.
 
-> ⚠️ This deliberately defeats a safety-adjacent limit. It is off by default, and you should
-> understand why that limit exists on your installation before turning it on.
+Two other limits can end a shower sooner:
 
-**With an Anthem Plus controller, the two Max Shower Durations must match.** The controller
-runs its own limit, and when it is longer than the valve's it can end a shower that Endless
-Shower is keeping alive, in a way that can't be undone. The controller's value is now
-readable from Kohler's cloud, so when Endless Shower is on and the two differ, a **repair
-notice** names both. Set them equal — the valve's with `Max Shower Duration`, the
-controller's on its own settings page — and it clears the next time Home Assistant
-reconnects to Kohler.
+* **An Anthem Plus controller** has its own Max Shower Duration, set on its web settings page
+  and shown by the controller's `Max Shower Duration` sensor. The shorter of the two wins.
+* **A favorite** stored on the valve carries its own run time. When it is shorter, it ends a
+  shower started from that favorite.
 
-Stopping the shower from the **Konnect app** or the **first-generation touchscreen** within a
-few seconds of the valve's limit can restart it: both stop the valve the same way the limit
-does. Stopping from Home Assistant never can.
+While water runs, `System Status` (and `Shower Active` on a two-zone valve) shows
+`flowing_for_seconds` and `seconds_remaining` until the valve's limit.
 
 ### Captures and journals
 
@@ -626,7 +625,6 @@ own development-style evidence to `/config/kohler_anthem_raw/`:
 | File | What it holds |
 |---|---|
 | `raw_mqtt_*.jsonl` | Every MQTT message, as received |
-| `cutoff_*.jsonl` | Run-time cutoff events and how each resolved |
 | `warmup_*.jsonl` | Warmup mode changes, with traffic windows either side |
 
 Each is capped at 8 MB per file and rolls over rather than pruning. The `Start new MQTT
@@ -675,9 +673,8 @@ Temperature and water units are read from your Konnect account, not chosen here 
 the Konnect app and they follow.
 
 There is no Configure dialog — every setting that can change after setup is an entity on the
-device page (`Endless Shower`, `Warmup`, and — where an Anthem Plus controller is present
-— `Warmup Auto-Restore`), where automations and
-dashboards can reach it too.
+device page (`Warmup`, `Max Shower Duration` and — where an Anthem Plus controller is
+present — `Warmup Auto-Restore`), where automations and dashboards can reach it too.
 
 ### Diagnostics
 
@@ -857,8 +854,9 @@ legacy delayed-start modes. It's shown so Home Assistant can display the true st
 disappears once you select something else. You can't select it.
 
 **The shower stops after about fifteen minutes.** That's the configured maximum run time, and
-it's working as designed. `Max Shower Duration` shows the ceiling. The
-`Endless Shower` switch will re-open the zone if you want that behaviour.
+it's working as designed. Raise the valve's `Max Shower Duration` (up to 60 minutes). With an
+Anthem Plus controller, raise the controller's own Max Shower Duration too — the shorter one
+wins. See [Shower time limits](#shower-time-limits).
 
 **Zone 2 entities are missing.** Expected on a single-zone valve — K-28209 and K-28210 have
 one zone.

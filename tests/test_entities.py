@@ -1873,8 +1873,9 @@ def test_a_zone2_word_is_refused_on_a_single_zone_valve(valve_model):
 def test_the_report_log_records_decisions_beside_messages(tmp_path):
     """One switch, one attachment: the wire traffic and the reasoning, on one clock.
 
-    A report that shows a cutoff was *seen and skipped* answers "why did Endless Shower not
-    fire" without asking the reader to line two files up by timestamp.
+    A report that shows a decision was *seen and skipped* answers "why didn't it act"
+    without asking the reader to line two files up by timestamp. The journal names are
+    labels; ReportLog accepts any.
     """
     import json
 
@@ -2157,7 +2158,6 @@ def _seed_valve(client):
         apply_preset_list=lambda payload: False,
     )
     valve.warmup = SimpleNamespace(note_seeded_mode=lambda before, after: None)
-    valve._learn_run_times = lambda state: None
     return valve
 
 
@@ -3073,7 +3073,6 @@ def _write_valve(monkeypatch, *, fail_after=None, verify_as=None, verify_delay=N
         },
     )
     valve._note_local_write = lambda: None
-    valve._learn_run_times = lambda state: None
     # Verification runs detached (0.18.2); capture the task so a test can await it.
     valve._background_tasks = set()
     issues: list[tuple[str, str]] = []
@@ -3556,17 +3555,15 @@ def test_k28211_hardware_outlet_ids_skip_unused_valve1_slot():
 
     class Holder:
         outlet_run_times = Valve.outlet_run_times
-        outlets_awaiting_run_time = Valve.outlets_awaiting_run_time
         _zone_limits = Valve._zone_limits
 
         def __init__(self):
             self.model = model
             self.gcs_state = state
-            self._run_times = {0: 1800, 1: 1800, 3: 1800, 4: 1800}
 
+    # Read straight from the outlet records, through the K-28211's skipped id 2.
     holder = Holder()
     assert holder.outlet_run_times == {1: 1800, 2: 1800, 3: 1800, 4: 1800}
-    assert holder.outlets_awaiting_run_time == []
     assert holder._zone_limits() == {1: (1800,), 2: (1800,)}
 
     # 99 is outside Konnect's outlet table (62 is a pair of foot sprays since 2026-10-07),

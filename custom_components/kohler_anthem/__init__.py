@@ -17,6 +17,8 @@ which has no Home Assistant imports and can be tested offline.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -24,7 +26,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 
-from .const import DOMAIN, ISSUE_NOT_SET_UP
+from .const import CONF_VALVES, DOMAIN
 from .coordinator import KohlerAnthemCoordinator, entry_reload_signature
 from .services import async_register_services, async_unregister_services
 
@@ -52,7 +54,21 @@ _REMOVED_ENTRY_KEYS = (
     "hub_outage_count",
     "hub_outage_last",
     "hub_outage_last_seconds",
+    # Endless Shower's two settings, removed 2026-10-08. These are the flat spellings from
+    # before 2026-09-08; the per-valve copies are `_REMOVED_VALVE_KEYS` below.
+    "outlet_run_times",
+    "restart_on_runtime_cutoff",
 )
+
+# ---------------------------------------------------------------------------
+# Removed 2026-10-08 — Endless Shower
+# ---------------------------------------------------------------------------
+# Its settings as stored per valve under `CONF_VALVES`, in data (`outlet_run_times`, the
+# learned run-time limits) and options (`restart_on_runtime_cutoff`, the switch).
+_REMOVED_VALVE_KEYS = ("outlet_run_times", "restart_on_runtime_cutoff")
+# Its Repairs cards: "Endless Shower can't act yet" and "the two Max Shower Durations
+# differ". Issues are stored apart from the entry, so they would otherwise outlive it.
+_REMOVED_ISSUE_PREFIXES = ("endless_shower_not_set_up", "durations_differ")
 
 # Unique-ID suffixes of the entities those diagnostics created. Home Assistant keeps a
 # registry row for every entity it has ever seen, so without this the three would linger as
@@ -79,16 +95,18 @@ _REMOVED_UNIQUE_ID_SUFFIXES = (
     # the control along with the sensor it replaced.
     "_outlet_1_max_run_time",
     "_outlet_1_max_temperature",
+    # The Endless Shower switch, removed 2026-10-08.
+    "_keep_water_running",
 )
 
 
 @callback
 def _async_purge_removed_diagnostics(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Strip the removed diagnostics' stored state from Home Assistant.
+    """Strip removed features' stored state from Home Assistant.
 
-    Covers both halves of "removed": the config-entry keys they persisted, and the entity
-    registry rows they own. Runs on every setup and is a no-op once clean, so a downgrade
-    followed by an upgrade cannot leave orphans behind.
+    Covers every half of "removed": the config-entry keys they persisted, the entity
+    registry rows they own, and any Repairs card they raised. Runs on every setup and is a
+    no-op once clean, so a downgrade followed by an upgrade cannot leave orphans behind.
     """
     stale = {key: entry.data[key] for key in _REMOVED_ENTRY_KEYS if key in entry.data}
     if stale:
@@ -111,11 +129,53 @@ def _async_purge_removed_diagnostics(hass: HomeAssistant, entry: ConfigEntry) ->
             },
         )
 
+    _async_strip_removed_valve_keys(hass, entry)
+
     registry = er.async_get(hass)
     for row in list(er.async_entries_for_config_entry(registry, entry.entry_id)):
         if row.unique_id.endswith(_REMOVED_UNIQUE_ID_SUFFIXES):
             registry.async_remove(row.entity_id)
-            _LOGGER.info("Removed retired diagnostic entity %s", row.entity_id)
+            _LOGGER.info("Removed retired entity %s", row.entity_id)
+
+    for domain, issue_id in list(ir.async_get(hass).issues):
+        if domain == DOMAIN and issue_id.startswith(_REMOVED_ISSUE_PREFIXES):
+            ir.async_delete_issue(hass, DOMAIN, issue_id)
+
+
+@callback
+def _async_strip_removed_valve_keys(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Drop `_REMOVED_VALVE_KEYS` from every valve's settings under `CONF_VALVES`."""
+
+    def stripped(container: Mapping[str, Any]) -> dict[str, Any] | None:
+        valves = container.get(CONF_VALVES)
+        if not isinstance(valves, dict) or not any(
+            key in (settings or {})
+            for settings in valves.values()
+            for key in _REMOVED_VALVE_KEYS
+        ):
+            return None
+        return {
+            **container,
+            CONF_VALVES: {
+                device_id: {
+                    k: v
+                    for k, v in (settings or {}).items()
+                    if k not in _REMOVED_VALVE_KEYS
+                }
+                for device_id, settings in valves.items()
+            },
+        }
+
+    data = stripped(entry.data)
+    options = stripped(entry.options)
+    if data is None and options is None:
+        return
+    hass.config_entries.async_update_entry(
+        entry,
+        data=entry.data if data is None else data,
+        options=entry.options if options is None else options,
+    )
+    _LOGGER.info("Removed the retired Endless Shower settings from the config entry")
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -178,16 +238,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if PLATFORMS:
         unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        # Repairs outlive the config entry, so an entry being removed would otherwise leave a
-        # card pointing at an integration that is no longer installed. Deleting a missing
-        # issue is a no-op, so this is safe on a plain reload too — setup re-raises it if the
-        # condition still holds.
         coordinator: KohlerAnthemCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
-        # The per-valve ids, plus the entry-only id an install from before 2026-09-08 may
-        # still be carrying.
-        ir.async_delete_issue(hass, DOMAIN, f"{ISSUE_NOT_SET_UP}_{entry.entry_id}")
-        for valve in coordinator.valves:
-            ir.async_delete_issue(hass, DOMAIN, valve.issue_id)
         await coordinator.async_shutdown_stream()
         if not hass.data[DOMAIN]:
             hass.data.pop(DOMAIN)
@@ -200,12 +251,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload only when the entry changed in a way that needs one.
 
-    This integration writes to its own config entry while running — the rotating refresh
-    token whenever B2C issues a new one, and ``maximumRunTime`` whenever the valve announces
-    one, which it does unprompted and can do mid-shower. Every one of those writes fires this
-    listener. Reloading on them would flap all entities to ``unavailable``, drop the MQTT
-    connection with its warm-up, and reset the run-time cutoff's zone clocks while the valve's
-    own timer kept running.
+    This integration writes to its own config entry while running — above all the rotating
+    refresh token, whenever B2C issues a new one. Every one of those writes fires this
+    listener. Reloading on them would flap all entities to ``unavailable`` and drop the MQTT
+    connection with its warm-up.
 
     So the decision is a comparison against ``coordinator.reload_signature``, the frozen
     snapshot taken when the coordinator was built. ``RELOAD_IGNORED_DATA_KEYS`` and

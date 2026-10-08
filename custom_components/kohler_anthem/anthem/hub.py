@@ -20,6 +20,7 @@ Two constraints shape every caller:
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass
 from typing import Any
 
@@ -137,13 +138,21 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+def _ip_or_none(value: Any) -> str | None:
+    """A usable IP address, or None for anything else — blank, "null", ``0.0.0.0``."""
+    try:
+        address = ipaddress.ip_address(str(value).strip())
+    except ValueError:
+        return None
+    return None if address.is_unspecified else str(address)
+
+
 @dataclass(frozen=True)
 class HubSettings:
     """The controller's own settings, as ``hub-configuration`` publishes them.
 
     **Max Shower Duration is here.** This integration long held that the controller's
-    duration was readable only through the local API, and so could not warn when it
-    disagreed with the valve's (``runtime_cutoff``). Konnect 3.0.6 reads it from
+    duration was readable only through the local API. Konnect 3.0.6 reads it from
     ``configuration.systemSettings.maxShowerDuration`` — minutes — as the default and cap
     for a favorite's duration. Whether the cloud copy follows an edit made on the
     controller's web page promptly is unverified: REST has been seen to lag on
@@ -155,6 +164,10 @@ class HubSettings:
     volume, any configured light group — and is reported when fitted but its ``parts``
     entry is not ``Connected``. That is the case ``HubCapabilities`` cannot see: it gates
     entities on ``parts`` alone, so a fitted accessory that drops off simply vanishes.
+
+    ``lan_ip`` is the controller's address on the home network: ``about.hub.wlan.ip``, the
+    address Konnect 3.0.6 opens the controller's web settings page (the "Embedded Server
+    Page") at, or ``about.hub.eth.ip`` for a wired controller with no Wi-Fi address.
     """
 
     max_shower_duration_minutes: int | None = None
@@ -229,8 +242,15 @@ class HubSettings:
 
         flow = system.get("flowRateEnable")
         hub = about.get("hub")
-        wlan = hub.get("wlan") if isinstance(hub, dict) else None
-        ip = wlan.get("ip") if isinstance(wlan, dict) else None
+        lan_ip = None
+        if isinstance(hub, dict):
+            for link in ("wlan", "eth"):
+                details = hub.get(link)
+                lan_ip = _ip_or_none(
+                    details.get("ip") if isinstance(details, dict) else None
+                )
+                if lan_ip:
+                    break
         return cls(
             max_shower_duration_minutes=_int_or_none(system.get("maxShowerDuration")),
             shower_max_temperature=_int_or_none(system.get("showerMaxTemperature")),
@@ -244,9 +264,17 @@ class HubSettings:
             steam_default_time=steam_time,
             steam_max_temperature=_int_or_none(steam.get("maxTemperature")),
             light_groups=tuple(str(x.get("name")) for x in lights if x.get("name")),
-            lan_ip=str(ip) if ip else None,
+            lan_ip=lan_ip,
             disconnected=tuple(disconnected),
         )
+
+    @property
+    def web_url(self) -> str | None:
+        """The controller's web settings page, or None when its address is unknown."""
+        if not self.lan_ip:
+            return None
+        host = f"[{self.lan_ip}]" if ":" in self.lan_ip else self.lan_ip
+        return f"http://{host}/"
 
     @property
     def steam_ready(self) -> bool:

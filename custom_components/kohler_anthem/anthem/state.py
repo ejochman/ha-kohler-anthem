@@ -212,9 +212,9 @@ class OutletLimits:
     maximum_flow_byte: int
     # Seconds before the valve closes the water on its own — `maximumRunTime`. Reported
     # per outlet, but **timed per zone**: the clock starts when the zone begins flowing
-    # and outlet changes within it do not reset it (see `runtime_cutoff.py`, where getting
-    # that wrong is documented in detail). 900 s on the reference install today, 3600 s
-    # before it was reconfigured — every outlet there has always agreed.
+    # and outlet changes within it do not reset it (`docs/protocol/gcs_valve.md`,
+    # "Run-time limit"). The outlets of one zone usually agree, but a lost write can leave
+    # them holding different values (seen 2026-09-10).
     #
     # None when this outlet's value has not been learned yet. Never assume one.
     maximum_run_time: int | None = None

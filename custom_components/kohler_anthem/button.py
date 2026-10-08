@@ -1,9 +1,8 @@
 """Buttons for the Kohler Anthem integration.
 
-Two: restart a valve (below), and start a new raw MQTT capture file. That exists because the natural way to get a
-fresh capture — restart Home Assistant — costs a full reload, drops the MQTT connection, and
-**clears the run-time cutoff tracking** (`ZoneCutoffDetector.forget()` on reconnect). None
-of which anyone wants in the middle of a sequence of shower experiments.
+Two: restart a valve (below), and start a new raw MQTT capture file. That exists because the
+natural way to get a fresh capture — restart Home Assistant — costs a full reload and drops
+the MQTT connection, which nobody wants in the middle of a sequence of shower experiments.
 
 Pressing this rolls the file instead: the current one is closed and a new one opened, so each
 experiment lands in its own file rather than being separated by timestamp afterwards.
@@ -58,10 +57,9 @@ class ValveRestartButton(KohlerValveEntity, ButtonEntity):
     a Home Assistant button cannot ask, which is why this one is **disabled by default** —
     enable it on purpose, from the device page.
 
-    🚿 **A restart stops any running water.** It is recorded as this integration's own
-    write, so Endless Shower never mistakes the reboot for a run-time cutoff and restarts
-    the shower into it. It **cannot** bring back a valve that has dropped off the cloud:
-    that valve never receives the command — power-cycle it at the breaker instead.
+    🚿 **A restart stops any running water.** It **cannot** bring back a valve that has
+    dropped off the cloud: that valve never receives the command — power-cycle it at the
+    breaker instead.
 
     Added 2026-10-07; app-confirmed, not yet pressed against hardware by this integration.
     """
@@ -80,12 +78,7 @@ class ValveRestartButton(KohlerValveEntity, ButtonEntity):
 
 
 class _NewCaptureMixin:
-    """Roll the diagnostic capture files. Shared so both device variants behave identically.
-
-    Rolls the raw MQTT capture **and** the cutoff debug log together. They are read as a
-    pair, joined on `ts`, so splitting one per experiment while the other keeps accumulating
-    would put the burden of matching them back on whoever reads them later.
-    """
+    """Roll the raw MQTT capture file. Shared so both device variants behave identically."""
 
     _attr_name = "Start new MQTT capture"
     _attr_icon = "mdi:file-restore-outline"
@@ -93,42 +86,26 @@ class _NewCaptureMixin:
 
     async def async_press(self) -> None:
         raw_log = self.coordinator.raw_log
-        cutoff_log = self.coordinator.cutoff_log
-        if raw_log is None and cutoff_log is None:
+        if raw_log is None:
             _LOGGER.warning("No diagnostic capture is set up; nothing to roll")
             return
-
-        def _roll() -> tuple[str | None, str | None]:
-            # Opens files and creates a directory — off the event loop.
-            return (
-                raw_log.roll() if raw_log else None,
-                cutoff_log.roll() if cutoff_log else None,
-            )
-
-        raw_path, cutoff_path = await self.hass.async_add_executor_job(_roll)
-        if raw_path is None and cutoff_path is None:
+        # Opens a file and creates a directory — off the event loop.
+        raw_path = await self.hass.async_add_executor_job(raw_log.roll)
+        if raw_path is None:
             _LOGGER.warning(
-                "Both diagnostic captures are OFF, so there is nothing to roll. Turn them "
-                "on with ENABLE_RAW_MQTT_LOG / ENABLE_CUTOFF_DEBUG_LOG in const.py, or the "
-                "logger.set_level action on "
-                "custom_components.kohler_anthem.anthem.raw_log / .cutoff_log"
+                "The raw MQTT capture is OFF, so there is nothing to roll. Turn it on with "
+                "ENABLE_RAW_MQTT_LOG in const.py, or the logger.set_level action on "
+                "custom_components.kohler_anthem.anthem.raw_log"
             )
             return
-        _LOGGER.warning(
-            "Started new capture files — raw MQTT: %s; cutoff debug: %s",
-            raw_path or "(off)",
-            cutoff_path or "(off)",
-        )
+        _LOGGER.warning("Started a new raw MQTT capture file: %s", raw_path)
 
     @property
     def extra_state_attributes(self) -> dict[str, object]:
         raw_log = self.coordinator.raw_log
-        cutoff_log = self.coordinator.cutoff_log
         return {
             "capture_enabled": bool(raw_log and raw_log.enabled),
             "current_file": (raw_log.path if raw_log else None),
-            "cutoff_log_enabled": bool(cutoff_log and cutoff_log.enabled),
-            "cutoff_log_file": (cutoff_log.path if cutoff_log else None),
         }
 
 

@@ -699,11 +699,11 @@ def stop_pair(
     ⚠️ **Deliberately not what the Konnect app sends.** The app's Stop writes byte 3 =
     ``0x40`` — the pause bit with no outlets, exactly :func:`pause_pair` with no mask
     (Konnect 3.0.6 ``db0/c.java``: the solo-write builder sets the per-valve pause bit when
-    stopping and zeroes the outlets; the older screens send the same). This integration keeps
-    ``0x00`` on purpose: ``runtime_cutoff`` restarts a shower on a ``0x40`` pause that lands
-    at the valve's own run-time limit, and a ``0x00`` stop is the one shape it never undoes.
-    Sending the app's word would make a Home Assistant stop that happened to coincide with
-    the limit indistinguishable from a cutoff. Both words leave the valve idle.
+    stopping and zeroes the outlets; the older screens send the same). The Anthem Plus
+    controller stops with ``0x00``. This integration chose ``0x00`` on 2026-08-13 so its stop
+    could never look like the valve's own run-time cutoff, which also pauses; that mattered to
+    Endless Shower, removed 2026-10-08. It stays because it is the form verified live from
+    here. Both words leave the valve idle.
     """
     return _mask_pair(model, VALVE_STOP_MASK, temperature_celsius, flow_percent)
 

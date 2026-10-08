@@ -217,6 +217,9 @@ class KohlerControllerEntity(CoordinatorEntity[KohlerAnthemCoordinator]):
             manufacturer="Kohler",
             model="Anthem+ System Controller",
             serial_number=controller.device.serial_number,
+            # The controller's web settings page, from the LAN address in
+            # `hub-configuration`. Kept current by the coordinator after each seed.
+            configuration_url=controller.settings.web_url,
         )
 
     @property
