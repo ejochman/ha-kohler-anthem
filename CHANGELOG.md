@@ -6,7 +6,7 @@ Notable changes for each tagged release. Versions correspond to git tags and to 
 version heading and publishes it as the release's Highlights.
 
 
-## Unreleased
+## 0.24 — 2026-10-08
 
 **New**
 
