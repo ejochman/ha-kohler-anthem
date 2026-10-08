@@ -9,7 +9,7 @@ Every push to `main` that passes CI is released. To choose the version, set it i
 `manifest.json` and it is released as written; leave it alone and the minor version is
 bumped (0.24 → 0.25).
 
-## Unreleased
+## 0.26 — 2026-10-08
 
 **Fixed**
 
